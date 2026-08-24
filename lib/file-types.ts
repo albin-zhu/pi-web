@@ -26,7 +26,16 @@ export const AUDIO_EXT_TO_MIME: Record<string, string> = {
   aac: "audio/aac",
   flac: "audio/flac",
   weba: "audio/webm",
-  webm: "audio/webm",
+};
+
+export const VIDEO_EXT_TO_MIME: Record<string, string> = {
+  mp4: "video/mp4",
+  m4v: "video/mp4",
+  webm: "video/webm",
+  mov: "video/quicktime",
+  mkv: "video/x-matroska",
+  ogv: "video/ogg",
+  avi: "video/x-msvideo",
 };
 
 export const DOCUMENT_EXT_TO_MIME: Record<DocumentPreviewKind, string> = {
@@ -50,6 +59,10 @@ export function getAudioMime(filePath: string): string | null {
   return AUDIO_EXT_TO_MIME[getFileExt(filePath)] ?? null;
 }
 
+export function getVideoMime(filePath: string): string | null {
+  return VIDEO_EXT_TO_MIME[getFileExt(filePath)] ?? null;
+}
+
 export function getDocumentMime(filePath: string): string | null {
   return DOCUMENT_EXT_TO_MIME[getFileExt(filePath) as DocumentPreviewKind] ?? null;
 }
@@ -66,6 +79,10 @@ export function isImagePath(filePath: string): boolean {
 
 export function isAudioPath(filePath: string): boolean {
   return getAudioMime(filePath) !== null;
+}
+
+export function isVideoPath(filePath: string): boolean {
+  return getVideoMime(filePath) !== null;
 }
 
 export function isDocumentPreviewPath(filePath: string): boolean {

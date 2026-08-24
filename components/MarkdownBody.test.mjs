@@ -90,6 +90,20 @@ test("does not normalize LaTeX delimiters inside raw HTML code", () => {
   assert.equal(normalizeDisplayMath(markdown), markdown);
 });
 
+test("renders local video markdown images as a video player", () => {
+  const html = renderToStaticMarkup(
+    React.createElement(MarkdownBody, {
+      cwd: "/home/me/project",
+      sessionId: "11111111-1111-1111-1111-111111111111",
+      onOpenFile() {},
+    }, "![clip](/tmp/clips/demo.mp4)"),
+  );
+
+  assert.match(html, /<video /);
+  assert.match(html, /src="\/api\/files\/tmp\/clips\/demo\.mp4\?type=read(?:&|&amp;)sessionId=11111111-1111-1111-1111-111111111111"/);
+  assert.doesNotMatch(html, /<img /);
+});
+
 test("does not normalize escaped delimiters or link destinations", () => {
   const escaped = String.raw`Literal: \\(x+y\\).`;
   const link = String.raw`[docs](https://example.com/\(manual\))`;
