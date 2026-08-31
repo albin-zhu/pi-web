@@ -10,6 +10,9 @@ import {
   requestMatchesRevision,
   setCachedSessionResponse,
 } from "@/lib/session-response-cache";
+import { paginateSessionContext, parseSessionMessageLimit } from "@/lib/session-pagination";
+import { summarizeSessionMessages, type SessionMessageStats } from "@/lib/session-message-stats";
+import type { SessionContext } from "@/lib/types";
 
 export async function GET(
   req: Request,
@@ -20,6 +23,8 @@ export async function GET(
   const leafId = url.searchParams.get("leafId") ?? undefined;
   const deferThinking = url.searchParams.has("deferThinking");
   const deferToolResultImages = url.searchParams.has("deferMedia");
+  const messageLimit = parseSessionMessageLimit(url.searchParams.get("limit"));
+  const beforeEntryId = url.searchParams.get("beforeEntryId");
 
   try {
     const rpc = getRpcSession(id);
@@ -29,7 +34,7 @@ export async function GET(
       return NextResponse.json({ error: "Session not found" }, { status: 404 });
     }
 
-    const responseScope = `context:${leafId ?? "default"}:${deferThinking ? 1 : 0}:${deferToolResultImages ? 1 : 0}`;
+    const responseScope = `context:${leafId ?? "default"}:${deferThinking ? 1 : 0}:${deferToolResultImages ? 1 : 0}:${messageLimit ?? "all"}:${beforeEntryId ?? "tail"}`;
     const persistedStat = !liveRpc && filePath ? statSync(filePath) : null;
     const revision = persistedStat
       ? createSessionRevision(persistedStat, responseScope)
@@ -45,17 +50,35 @@ export async function GET(
       return new NextResponse(null, { status: 304, headers: revisionHeaders });
     }
     if (revision && responseCacheKey) {
-      const cached = getCachedSessionResponse<{ context: unknown }>(responseCacheKey, revision);
+      const cached = getCachedSessionResponse<object>(responseCacheKey, revision);
       if (cached) return NextResponse.json(cached, { headers: revisionHeaders });
     }
 
-    const sm = liveRpc?.inner.sessionManager ?? SessionManager.open(filePath!);
-    const context = buildSessionContext(sm.getEntries() as never, leafId, {
+    const contextScope = `context-base:${leafId ?? "null"}:${deferThinking ? 1 : 0}:${deferToolResultImages ? 1 : 0}`;
+    const contextCacheKey = filePath
+      ? `${sessionPathKey(filePath)}:${contextScope}`
+      : null;
+    const contextRevision = persistedStat
+      ? createSessionRevision(persistedStat, contextScope)
+      : null;
+    const cachedContext = contextCacheKey && contextRevision
+      ? getCachedSessionResponse<{ context: SessionContext; messageStats: SessionMessageStats }>(
+          contextCacheKey,
+          contextRevision,
+        )
+      : undefined;
+    const sm = cachedContext ? null : (liveRpc?.inner.sessionManager ?? SessionManager.open(filePath!));
+    const fullContext = cachedContext?.context ?? buildSessionContext(sm!.getEntries() as never, leafId, {
       deferThinking,
       deferToolResultImages,
     });
+    const messageStats = cachedContext?.messageStats ?? summarizeSessionMessages(fullContext.messages);
+    if (!cachedContext && contextCacheKey && contextRevision) {
+      setCachedSessionResponse(contextCacheKey, contextRevision, { context: fullContext, messageStats });
+    }
+    const context = paginateSessionContext(fullContext, messageLimit, beforeEntryId);
 
-    const responseData = { context };
+    const responseData = { context, messageStats };
     if (revision && responseCacheKey) {
       setCachedSessionResponse(responseCacheKey, revision, responseData);
     }

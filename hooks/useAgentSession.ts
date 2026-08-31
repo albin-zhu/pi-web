@@ -36,6 +36,8 @@ import {
   getSessionViewSnapshot,
   setSessionViewSnapshot,
 } from "@/lib/session-view-cache";
+import { SESSION_MESSAGE_PAGE_SIZE, type PaginatedSessionContext } from "@/lib/session-pagination";
+import { summarizeSessionMessages, type SessionMessageStats } from "@/lib/session-message-stats";
 
 export interface SessionData {
   sessionId: string;
@@ -43,12 +45,11 @@ export interface SessionData {
   totalActiveMs: number;
   tree: SessionTreeNode[];
   leafId: string | null;
-  context: {
-    messages: AgentMessage[];
-    entryIds: string[];
+  context: PaginatedSessionContext & {
     thinkingLevel: string;
     model: { provider: string; modelId: string } | null;
   };
+  messageStats: SessionMessageStats;
 }
 
 interface AgentEvent {
@@ -321,6 +322,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [extensionStatuses, setExtensionStatuses] = useState<ExtensionStatusItem[]>([]);
   const [extensionWidgets, setExtensionWidgets] = useState<ExtensionWidgetItem[]>([]);
   const [queuedMessages, setQueuedMessages] = useState<QueuedMessages>({ steering: [], followUp: [] });
+  const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
 
   const eventConnectionRef = useRef<AgentEventConnection | null>(null);
   const eventStreamGraceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -330,6 +332,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const sessionRevisionRef = useRef<string | null>(initialSessionSnapshot?.revision ?? null);
   const messagesRef = useRef(messages);
   const activeLeafIdRef = useRef(activeLeafId);
+  const entryIdsRef = useRef(entryIds);
+  const loadingOlderMessagesRef = useRef(false);
   const sessionPropIdRef = useRef<string | null>(session?.id ?? null);
   const sessionRunningRef = useRef(Boolean(sessionRunning));
   const agentRunningRef = useRef(false);
@@ -360,6 +364,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   messagesRef.current = messages;
   activeLeafIdRef.current = activeLeafId;
+  entryIdsRef.current = entryIds;
   sessionPropIdRef.current = session?.id ?? null;
   sessionRunningRef.current = Boolean(sessionRunning);
 
@@ -438,43 +443,23 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     if (sessionStatsOverride) {
       return { ...sessionStatsOverride, totalActiveMs: data?.totalActiveMs };
     }
-    const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
-    let cost = 0;
-    let userMessages = 0;
-    let assistantMessages = 0;
-    let toolResults = 0;
-    let toolCalls = 0;
-    for (const msg of messages) {
-      if (msg.role === "user") userMessages += 1;
-      if (msg.role === "toolResult") toolResults += 1;
-      if (msg.role !== "assistant") continue;
-      assistantMessages += 1;
-      const u = (msg as import("@/lib/types").AssistantMessage).usage;
-      toolCalls += (msg as import("@/lib/types").AssistantMessage).content.filter((c) => c.type === "toolCall").length;
-      if (!u) continue;
-      tokens.input += u.input ?? 0;
-      tokens.output += u.output ?? 0;
-      tokens.cacheRead += u.cacheRead ?? 0;
-      tokens.cacheWrite += u.cacheWrite ?? 0;
-      cost += u.cost?.total ?? 0;
-    }
-    tokens.total = tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite;
-    if (tokens.total === 0 && messages.length === 0) return null;
+    const hasPartialContext = Boolean(
+      data?.context.totalMessages !== undefined
+      && messages.length < data.context.totalMessages
+    );
+    const summary = hasPartialContext && data?.messageStats
+      ? data.messageStats
+      : summarizeSessionMessages(messages);
+    if (summary.tokens.total === 0 && summary.totalMessages === 0) return null;
     return {
       sessionFile: data?.filePath || undefined,
       sessionId: sessionIdRef.current ?? session?.id ?? "",
       sessionName: session?.name,
-      userMessages,
-      assistantMessages,
-      toolCalls,
-      toolResults,
-      totalMessages: messages.length,
-      tokens,
-      cost,
+      ...summary,
       totalActiveMs: data?.totalActiveMs,
       ...(contextUsage ? { contextUsage } : {}),
     } satisfies SessionStatsInfo;
-  }, [messages, sessionStatsOverride, contextUsage, data?.filePath, data?.totalActiveMs, session?.id, session?.name]);
+  }, [messages, sessionStatsOverride, contextUsage, data, session?.id, session?.name]);
 
   // Keep a bounded stale-while-revalidate snapshot. ChatWindow captures the
   // scroll/render window separately so revisiting a session can paint in the
@@ -506,7 +491,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const leafAtStart = activeLeafIdRef.current;
     try {
       if (showLoading) setLoading(true);
-      const params = new URLSearchParams({ deferThinking: "1", deferMedia: "1" });
+      const params = new URLSearchParams({
+        deferThinking: "1",
+        deferMedia: "1",
+        limit: String(SESSION_MESSAGE_PAGE_SIZE),
+      });
       const revision = sessionRevisionRef.current;
       const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}?${params}`, {
         headers: revision ? { "If-None-Match": revision } : undefined,
@@ -515,6 +504,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         if (sessionIdRef.current === sid) {
           sessionRevisionRef.current = null;
           deleteSessionViewSnapshot(sid);
+          activeLeafIdRef.current = null;
+          messagesRef.current = [];
+          entryIdsRef.current = [];
           setData(null);
           setActiveLeafId(null);
           setMessages([]);
@@ -537,6 +529,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         );
         if (!cachedViewChanged) {
           const persistedMessages = d.context.messages;
+          activeLeafIdRef.current = d.leafId;
+          messagesRef.current = persistedMessages;
+          entryIdsRef.current = d.context.entryIds ?? [];
           setData(d);
           setActiveLeafId(d.leafId);
           setMessages(persistedMessages);
@@ -586,16 +581,85 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const loadContext = useCallback(async (sid: string, leafId: string | null) => {
     try {
-      const params = new URLSearchParams({ deferThinking: "1", deferMedia: "1" });
+      const params = new URLSearchParams({
+        deferThinking: "1",
+        deferMedia: "1",
+        limit: String(SESSION_MESSAGE_PAGE_SIZE),
+      });
       if (leafId) params.set("leafId", leafId);
       const url = `/api/sessions/${encodeURIComponent(sid)}/context?${params}`;
       const res = await fetch(url);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const d = await res.json() as { context: { messages: AgentMessage[]; entryIds: string[] } };
+      const d = await res.json() as { context: PaginatedSessionContext; messageStats: SessionMessageStats };
+      if (sessionIdRef.current !== sid || activeLeafIdRef.current !== leafId) return;
+      messagesRef.current = d.context.messages;
+      entryIdsRef.current = d.context.entryIds ?? [];
       setMessages(d.context.messages);
       setEntryIds(d.context.entryIds ?? []);
+      setData((current) => current?.sessionId === sid
+        ? { ...current, leafId, context: d.context, messageStats: d.messageStats }
+        : current);
     } catch (e) {
       console.error("Failed to load context:", e);
+    }
+  }, []);
+
+  const loadOlderMessages = useCallback(async () => {
+    const sid = sessionIdRef.current;
+    const firstEntryId = entryIdsRef.current[0];
+    const leafId = activeLeafIdRef.current;
+    if (!sid || !firstEntryId || loadingOlderMessagesRef.current) return false;
+    loadingOlderMessagesRef.current = true;
+    setLoadingOlderMessages(true);
+    try {
+      const params = new URLSearchParams({
+        deferThinking: "1",
+        deferMedia: "1",
+        limit: String(SESSION_MESSAGE_PAGE_SIZE),
+        beforeEntryId: firstEntryId,
+      });
+      if (leafId) params.set("leafId", leafId);
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}/context?${params}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const d = await res.json() as { context: PaginatedSessionContext; messageStats: SessionMessageStats };
+      if (sessionIdRef.current !== sid || activeLeafIdRef.current !== leafId) return false;
+
+      const existingIds = new Set(entryIdsRef.current);
+      const olderMessages: AgentMessage[] = [];
+      const olderEntryIds: string[] = [];
+      for (let index = 0; index < d.context.entryIds.length; index += 1) {
+        const entryId = d.context.entryIds[index];
+        if (existingIds.has(entryId)) continue;
+        olderEntryIds.push(entryId);
+        olderMessages.push(d.context.messages[index]);
+      }
+      const nextMessages = [...olderMessages, ...messagesRef.current];
+      const nextEntryIds = [...olderEntryIds, ...entryIdsRef.current];
+      messagesRef.current = nextMessages;
+      entryIdsRef.current = nextEntryIds;
+      setMessages(nextMessages);
+      setEntryIds(nextEntryIds);
+      setData((current) => current?.sessionId === sid
+        ? {
+            ...current,
+            context: {
+              ...current.context,
+              messages: nextMessages,
+              entryIds: nextEntryIds,
+              totalMessages: d.context.totalMessages,
+              startIndex: d.context.startIndex,
+              hasMore: d.context.hasMore,
+            },
+            messageStats: d.messageStats,
+          }
+        : current);
+      return olderMessages.length > 0;
+    } catch (e) {
+      console.error("Failed to load older messages:", e);
+      return false;
+    } finally {
+      loadingOlderMessagesRef.current = false;
+      if (sessionHookMountedRef.current) setLoadingOlderMessages(false);
     }
   }, []);
 
@@ -1502,12 +1566,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const sid = sessionIdRef.current;
     if (!sid) return;
     sendAgentCommand(sid, { type: "navigate_tree", targetId: entryId }).catch(() => {});
+    activeLeafIdRef.current = entryId;
     setActiveLeafId(entryId);
     await loadContext(sid, entryId);
   }, [loadContext]);
 
   const handleLeafChange = useCallback(async (leafId: string | null) => {
     if (bashRunningRef.current) return;
+    activeLeafIdRef.current = leafId;
     setActiveLeafId(leafId);
     const sid = sessionIdRef.current;
     if (!sid) return;
@@ -1987,6 +2053,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     retryInfo, contextUsage, systemPrompt, forkingEntryId,
     isCompacting, compactError, compactResult, currentModel, displayModel, modelSwitching, sessionStats,
     slashCommands, slashCommandsLoading, queuedMessages,
+    loadingOlderMessages,
+    hasOlderMessages: data?.context.hasMore ?? false,
+    olderMessageCount: data?.context.startIndex ?? 0,
     notices: noticeState.visible, extensionDialog, extensionCustomUi, extensionStatuses, extensionWidgets, respondToExtensionUi, sendExtensionCustomInput,
     isAutoModelSelection: isNew && newSessionModel === null,
     agentPhase,
@@ -1999,6 +2068,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     handleSend, handleAbort, handleFork, handleNavigate, handleModelChange,
     handleCompact, handleSteer, handleFollowUp, handlePromptWithStreamingBehavior, handleAbortCompaction,
     handleRecallQueue,
+    loadOlderMessages,
     handleBuiltinSlashCommand,
     handleToolPresetChange, handleThinkingLevelChange, loadTools, loadSlashCommands, setActiveLeafId, setData, setMessages,
     scrollToBottom, scrollUserMsgToTop,

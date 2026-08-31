@@ -20,6 +20,8 @@ import {
   requestMatchesRevision,
   setCachedSessionResponse,
 } from "@/lib/session-response-cache";
+import { paginateSessionContext, parseSessionMessageLimit } from "@/lib/session-pagination";
+import { summarizeSessionMessages } from "@/lib/session-message-stats";
 
 export async function GET(
   req: Request,
@@ -37,7 +39,8 @@ export async function GET(
     const searchParams = new URL(req.url).searchParams;
     const deferThinking = searchParams.has("deferThinking");
     const deferToolResultImages = searchParams.has("deferMedia");
-    const responseScope = `full:${deferThinking ? 1 : 0}:${deferToolResultImages ? 1 : 0}`;
+    const messageLimit = parseSessionMessageLimit(searchParams.get("limit"));
+    const responseScope = `full:${deferThinking ? 1 : 0}:${deferToolResultImages ? 1 : 0}:${messageLimit ?? "all"}`;
     const persistedStat = !liveRpc && resolvedPath ? statSync(resolvedPath) : null;
     const revision = persistedStat
       ? createSessionRevision(persistedStat, responseScope)
@@ -62,7 +65,17 @@ export async function GET(
     const entries = sm.getEntries();
     const leafId = sm.getLeafId();
     const tree = projectTreeForResponse(sm.getTree());
-    const context = buildSessionContext(entries as never, leafId, { deferThinking, deferToolResultImages });
+    const fullContext = buildSessionContext(entries as never, leafId, { deferThinking, deferToolResultImages });
+    const messageStats = summarizeSessionMessages(fullContext.messages);
+    if (persistedStat && resolvedPath) {
+      const contextScope = `context-base:${leafId ?? "null"}:${deferThinking ? 1 : 0}:${deferToolResultImages ? 1 : 0}`;
+      setCachedSessionResponse(
+        `${sessionPathKey(resolvedPath)}:${contextScope}`,
+        createSessionRevision(persistedStat, contextScope),
+        { context: fullContext, messageStats },
+      );
+    }
+    const context = paginateSessionContext(fullContext, messageLimit);
     const totalActiveMs = computeSessionTotalActiveMs(entries);
 
     const header = sm.getHeader();
@@ -79,10 +92,10 @@ export async function GET(
       name: sm.getSessionName(),
       created: header.timestamp,
       modified,
-      messageCount: context.messages.length,
-      firstMessage: context.messages.find((m) => m.role === "user")
+      messageCount: fullContext.messages.length,
+      firstMessage: fullContext.messages.find((m) => m.role === "user")
         ? (() => {
-            const msg = context.messages.find((m) => m.role === "user")!;
+            const msg = fullContext.messages.find((m) => m.role === "user")!;
             const c = (msg as { content: unknown }).content;
             return typeof c === "string" ? c : (Array.isArray(c) ? (c.find((b: { type: string }) => b.type === "text") as { text: string } | undefined)?.text ?? "" : "") || "(no messages)";
           })()
@@ -98,6 +111,7 @@ export async function GET(
       leafId,
       tree,
       context,
+      messageStats,
       totalActiveMs,
     };
     if (revision && responseCacheKey) {

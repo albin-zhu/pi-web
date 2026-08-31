@@ -34,6 +34,20 @@ test("captures and restores the cached session render window", () => {
   assert.match(chatWindowSource, /atTail: isScrollAtTail/);
 });
 
+test("loads older session messages by stable entry cursor", () => {
+  const olderSource = source.slice(
+    source.indexOf("  const loadOlderMessages = useCallback"),
+    source.indexOf("  const loadTools = useCallback"),
+  );
+
+  assert.match(olderSource, /beforeEntryId: firstEntryId/);
+  assert.match(olderSource, /existingIds = new Set\(entryIdsRef\.current\)/);
+  assert.match(olderSource, /nextMessages = \[\.\.\.olderMessages, \.\.\.messagesRef\.current\]/);
+  assert.match(olderSource, /activeLeafIdRef\.current !== leafId/);
+  assert.match(chatWindowSource, /if \(hasOlderMessages\) \{[\s\S]*?loadOlderMessages\(\)/);
+  assert.match(chatWindowSource, /captureScrollDistance\(container\.scrollHeight, container\.scrollTop\)/);
+});
+
 test("keeps the session event stream open through the idle grace window", () => {
   const finishSource = source.slice(
     source.indexOf("const finishPromptWithoutStream"),
