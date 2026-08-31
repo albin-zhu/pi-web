@@ -68,3 +68,9 @@ test("does not expose disk-backed actions for transient sessions", () => {
   assert.match(sessionItemSource, /if \(session\.transient\) return;/);
   assert.match(sessionItemSource, /\{hovered && !session\.transient && \(/);
 });
+
+test("prefetches an unvisited session only after hover intent", () => {
+  assert.match(sessionItemSource, /if \(isSelected \|\| session\.transient\) return/);
+  assert.match(sessionItemSource, /setTimeout\(\(\) => \{[\s\S]*?prefetchSessionView\(session\.id\)[\s\S]*?\}, 160\)/);
+  assert.match(sessionItemSource, /clearTimeout\(prefetchTimerRef\.current\)/);
+});

@@ -38,6 +38,7 @@ import {
 } from "@/lib/session-view-cache";
 import { SESSION_MESSAGE_PAGE_SIZE, type PaginatedSessionContext } from "@/lib/session-pagination";
 import { summarizeSessionMessages, type SessionMessageStats } from "@/lib/session-message-stats";
+import { loadSessionView } from "@/lib/session-view-loader";
 
 export interface SessionData {
   sessionId: string;
@@ -491,16 +492,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const leafAtStart = activeLeafIdRef.current;
     try {
       if (showLoading) setLoading(true);
-      const params = new URLSearchParams({
-        deferThinking: "1",
-        deferMedia: "1",
-        limit: String(SESSION_MESSAGE_PAGE_SIZE),
-      });
-      const revision = sessionRevisionRef.current;
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}?${params}`, {
-        headers: revision ? { "If-None-Match": revision } : undefined,
-      });
-      if (res.status === 404) {
+      const result = await loadSessionView<SessionData>(sid, sessionRevisionRef.current);
+      if (result.status === "missing") {
         if (sessionIdRef.current === sid) {
           sessionRevisionRef.current = null;
           deleteSessionViewSnapshot(sid);
@@ -515,14 +508,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         }
         return null;
       }
-      if (res.status === 304) {
+      if (result.status === "unchanged") {
         messagesLoaded = true;
         setError(null);
       } else {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const d = await res.json() as SessionData;
+        const d = result.data;
         if (sessionIdRef.current !== sid) return null;
-        sessionRevisionRef.current = res.headers.get("etag");
+        sessionRevisionRef.current = result.revision ?? null;
         const cachedViewChanged = protectCachedView && (
           messagesRef.current !== messagesAtStart
           || activeLeafIdRef.current !== leafAtStart

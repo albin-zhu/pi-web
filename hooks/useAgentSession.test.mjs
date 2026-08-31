@@ -20,8 +20,8 @@ test("revisiting a session paints its cached view while revalidating in the back
   assert.match(source, /getSessionViewSnapshot<SessionData>\(session\.id\)/);
   assert.match(source, /useState\(!isNew && !initialSessionSnapshot\)/);
   assert.match(mountSource, /loadSession\(session\.id, !initialSessionSnapshot, true, Boolean\(initialSessionSnapshot\)\)/);
-  assert.match(loadSource, /headers: revision \? \{ "If-None-Match": revision \} : undefined/);
-  assert.match(loadSource, /res\.status === 304/);
+  assert.match(loadSource, /loadSessionView<SessionData>\(sid, sessionRevisionRef\.current\)/);
+  assert.match(loadSource, /result\.status === "unchanged"/);
   assert.match(loadSource, /cachedViewChanged = protectCachedView/);
   assert.match(loadSource, /messagesRef\.current !== messagesAtStart/);
   assert.match(loadSource, /activeLeafIdRef\.current !== leafAtStart/);
