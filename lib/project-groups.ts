@@ -51,3 +51,10 @@ export function sessionsForProject(
 ): SessionInfo[] {
   return sessions.filter((session) => workspaceKeyOf(session) === projectKey);
 }
+
+/** Folder label for a project path: `D:\\workspace\\pi-web` → `pi-web`. */
+export function projectFolderName(root: string): string {
+  const normalized = root.replace(/\\/g, "/").replace(/\/+$/, "");
+  const base = normalized.split("/").pop();
+  return base || root;
+}

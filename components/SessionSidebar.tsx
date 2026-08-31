@@ -1,11 +1,11 @@
 "use client";
 
-import { useEffect, useLayoutEffect, useState, useCallback, useMemo, useRef, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useState, useCallback, useMemo, useRef, type ReactNode } from "react";
 import type { SessionInfo } from "@/lib/types";
 import { loadExplorerOpen, saveExplorerOpen } from "@/lib/file-explorer-state";
 import { dispatchSessionRowContextMenu } from "@/lib/session-row-context-menu";
 import { skillExpansionToCommand } from "@/lib/slash-display";
-import { getProjectActivity, getRecentProjects, sessionsForProject } from "@/lib/project-groups";
+import { getProjectActivity, getRecentProjects, projectFolderName, sessionsForProject } from "@/lib/project-groups";
 import { workspaceKeyOf } from "@/lib/workspace-memory";
 import { useI18n } from "@/hooks/useI18n";
 import { DirectoryPicker } from "./DirectoryPicker";
@@ -138,6 +138,7 @@ interface ValidatedProject {
 
 const UNREAD_SESSIONS_STORAGE_KEY = "pi-web:unread-session-ids";
 const RUNNING_SESSIONS_POLL_MS = 2500;
+const COLLAPSED_SESSION_LIMIT = 5;
 
 function loadUnreadSessionIds(): Set<string> {
   if (typeof window === "undefined") return new Set();
@@ -176,238 +177,17 @@ function formatRelativeTime(dateStr: string): string {
   return date.toLocaleDateString();
 }
 
-/** Substitute the home dir prefix with ~ (no path truncation — see PathLabel) */
-function displayCwd(cwd: string, homeDir?: string): string {
-  return (homeDir && cwd.startsWith(homeDir)) ? "~" + cwd.slice(homeDir.length) : cwd;
-}
-
-/**
- * Path label that ellipsizes on the LEFT, keeping the (most relevant) trailing
- * segments visible: "…orkspace/pi-web". Shows as much of the path as fits
- * instead of a fixed number of segments. The rtl container moves the ellipsis
- * to the left edge; the inner plaintext bidi isolation keeps the path itself
- * rendered strictly left-to-right (no punctuation reordering).
- */
-function PathLabel({ text, style }: { text: string; style?: CSSProperties }) {
-  return (
-    <span
-      style={{
-        overflow: "hidden",
-        textOverflow: "ellipsis",
-        whiteSpace: "nowrap",
-        display: "block",
-        minWidth: 0,
-        lineHeight: 1.35,
-        direction: "rtl",
-        textAlign: "left",
-        ...style,
-      }}
-    >
-      <span style={{ unicodeBidi: "plaintext" }}>{text}</span>
-    </span>
-  );
-}
-
-const DROPDOWN_ANIMATION_MS = 140;
-
-function AnimatedDropdown({ open, children, style }: { open: boolean; children: ReactNode; style: CSSProperties }) {
-  const [mounted, setMounted] = useState(open);
-  const [visible, setVisible] = useState(open);
-
-  useEffect(() => {
-    let frame: number | undefined;
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-
-    if (open) {
-      setMounted(true);
-      setVisible(false);
-      frame = window.requestAnimationFrame(() => {
-        frame = window.requestAnimationFrame(() => setVisible(true));
-      });
-    } else {
-      setVisible(false);
-      timeout = setTimeout(() => setMounted(false), DROPDOWN_ANIMATION_MS);
-    }
-
-    return () => {
-      if (frame !== undefined) window.cancelAnimationFrame(frame);
-      if (timeout) clearTimeout(timeout);
-    };
-  }, [open]);
-
-  if (!mounted) return null;
-
-  return (
-    <div
-      style={{
-        ...style,
-        opacity: visible ? 1 : 0,
-        transform: visible ? "translateY(0) scale(1)" : "translateY(-8px) scale(0.96)",
-        transformOrigin: "top center",
-        transition: `opacity ${DROPDOWN_ANIMATION_MS}ms ease, transform ${DROPDOWN_ANIMATION_MS}ms ease`,
-        pointerEvents: open ? "auto" : "none",
-      }}
-    >
-      {children}
-    </div>
-  );
-}
-
-
-
-interface SessionTreeNode {
-  session: SessionInfo;
-  children: SessionTreeNode[];
-}
-
-function buildSessionTree(sessions: SessionInfo[]): SessionTreeNode[] {
-  const byId = new Map<string, SessionTreeNode>();
-  for (const s of sessions) {
-    byId.set(s.id, { session: s, children: [] });
-  }
-
-  // Build a map of parentSessionId chains so we can resolve missing ancestors
-  const parentOf = new Map<string, string>();
-  for (const s of sessions) {
-    if (s.parentSessionId) parentOf.set(s.id, s.parentSessionId);
-  }
-
-  // Walk up the parentSessionId chain to find the nearest ancestor that exists in byId
-  function resolveAncestor(id: string): string | null {
-    let cur = parentOf.get(id);
-    const visited = new Set<string>();
-    while (cur) {
-      if (visited.has(cur)) return null; // cycle guard
-      visited.add(cur);
-      if (byId.has(cur)) return cur;
-      cur = parentOf.get(cur);
-    }
-    return null;
-  }
-
-  const roots: SessionTreeNode[] = [];
-  for (const node of byId.values()) {
-    const ancestor = resolveAncestor(node.session.id);
-    if (ancestor) {
-      byId.get(ancestor)!.children.push(node);
-    } else {
-      roots.push(node);
-    }
-  }
-
-  // Sort each level by modified desc
-  const sort = (nodes: SessionTreeNode[]) => {
-    nodes.sort((a, b) => b.session.modified.localeCompare(a.session.modified));
-    nodes.forEach((n) => sort(n.children));
-  };
-  sort(roots);
-  return roots;
-}
-
-const SCRAMBLE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*";
-
-function useScramble(target: string, running: boolean): string {
-  const [display, setDisplay] = useState(target);
-  const frameRef = useRef<number | null>(null);
-  const iterRef = useRef(0);
-
-  useEffect(() => {
-    if (!running) {
-      setDisplay(target);
-      return;
-    }
-    iterRef.current = 0;
-    const totalFrames = target.length * 4;
-
-    const step = () => {
-      iterRef.current += 1;
-      const progress = iterRef.current / totalFrames;
-      const resolved = Math.floor(progress * target.length);
-
-      setDisplay(
-        target
-          .split("")
-          .map((char, i) => {
-            if (char === " ") return " ";
-            if (i < resolved) return char;
-            return SCRAMBLE_CHARS[Math.floor(Math.random() * SCRAMBLE_CHARS.length)];
-          })
-          .join("")
-      );
-
-      if (iterRef.current < totalFrames) {
-        frameRef.current = requestAnimationFrame(step);
-      } else {
-        setDisplay(target);
-      }
-    };
-
-    frameRef.current = requestAnimationFrame(step);
-    return () => { if (frameRef.current) cancelAnimationFrame(frameRef.current); };
-  }, [target, running]);
-
-  return display;
-}
-
-function PiWebTitle() {
-  const [showVersion, setShowVersion] = useState(false);
-  const [scrambling, setScrambling] = useState(false);
-  const revertTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const target = showVersion ? `${process.env.NEXT_PUBLIC_APP_VERSION ?? "0.0.0"}p${process.env.NEXT_PUBLIC_PI_VERSION ?? "0.0.0"}` : "Pi Web";
-  const display = useScramble(target, scrambling);
-
-  const triggerScramble = useCallback((toVersion: boolean) => {
-    setShowVersion(toVersion);
-    setScrambling(true);
-    setTimeout(() => setScrambling(false), (toVersion ? 6 : 8) * 4 * (1000 / 60) + 100);
-  }, []);
-
-  const handleClick = useCallback(() => {
-    if (revertTimerRef.current) clearTimeout(revertTimerRef.current);
-
-    const next = !showVersion;
-    triggerScramble(next);
-
-    if (next) {
-      revertTimerRef.current = setTimeout(() => triggerScramble(false), 3000);
-    }
-  }, [showVersion, triggerScramble]);
-
-  useEffect(() => () => { if (revertTimerRef.current) clearTimeout(revertTimerRef.current); }, []);
-
-  return (
-    <button
-      onClick={handleClick}
-      style={{
-        background: "none", border: "none", padding: 0, cursor: "default",
-        fontWeight: 700, fontSize: 15, letterSpacing: "-0.01em",
-        color: showVersion ? "var(--accent)" : "var(--text)",
-        fontFamily: "var(--font-mono)",
-        minWidth: "6ch",
-      }}
-    >
-      {display}
-    </button>
-  );
-}
-
 export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSession, initialSessionId, skipInitialProjectSelection, onInitialRestoreDone, refreshKey, onSessionDeleted, selectedCwd: selectedCwdProp, onCwdChange, onOpenFile, explorerRefreshKey, onExplorerRefresh, onAtMention, onAtMentions, onBackgroundTaskDone, onRunningSessionIdsChange }: Props) {
   const { t } = useI18n();
   const [allSessions, setAllSessions] = useState<SessionInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedCwd, setSelectedCwd] = useState<string | null>(null);
-  const [homeDir, setHomeDir] = useState<string>("");
-  const [dropdownOpen, setDropdownOpen] = useState(false);
-  const [projectFilter, setProjectFilter] = useState("");
-  const [wtFilter, setWtFilter] = useState("");
   const [customPathOpen, setCustomPathOpen] = useState(false);
   const [customPathValue, setCustomPathValue] = useState("");
   const [customPathError, setCustomPathError] = useState<string | null>(null);
   const [customPathValidating, setCustomPathValidating] = useState(false);
   const [validatedProject, setValidatedProject] = useState<ValidatedProject | null>(null);
-  const dropdownRef = useRef<HTMLDivElement>(null);
   // Worktree switcher state
   const [worktreeState, setWorktreeState] = useState<WorktreeState | null>(null);
   const [wtDropdownOpen, setWtDropdownOpen] = useState(false);
@@ -416,7 +196,6 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   const [wtError, setWtError] = useState<string | null>(null);
   const [wtBusy, setWtBusy] = useState(false);
   const [wtConfirmRemove, setWtConfirmRemove] = useState<string | null>(null);
-  const [worktreeLoadingCwd, setWorktreeLoadingCwd] = useState<string | null>(null);
   const wtDropdownRef = useRef<HTMLDivElement>(null);
   const wtNewInputRef = useRef<HTMLInputElement>(null);
   const [explorerOpen, setExplorerOpen] = useState(true);
@@ -427,6 +206,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   const [sessionRefreshDone, setSessionRefreshDone] = useState(false);
   const [explorerRefreshDone, setExplorerRefreshDone] = useState(false);
   const [runningSessionIds, setRunningSessionIds] = useState<Set<string>>(() => new Set());
+  const [expandedProjectKeys, setExpandedProjectKeys] = useState<Set<string>>(() => new Set());
   const [unreadSessionIds, setUnreadSessionIds] = useState<Set<string>>(() => loadUnreadSessionIds());
   const previousRunningSessionIdsRef = useRef<Set<string>>(new Set());
   // Once polling has delivered a snapshot it is the source of truth for
@@ -592,12 +372,6 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
     if (explorerRefreshKey !== undefined) setExplorerKey((k) => k + 1);
   }, [explorerRefreshKey]);
 
-  useEffect(() => {
-    fetch("/api/home").then((r) => r.json()).then((d: { home?: string }) => {
-      if (d.home) setHomeDir(d.home);
-    }).catch(() => {});
-  }, []);
-
   const restoredRef = useRef(false);
 
   const projectSelection = useCallback((root: string, key: string): ProjectSelection => ({
@@ -662,16 +436,13 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   useLayoutEffect(() => {
     if (!selectedCwd) {
       setWorktreeState(null);
-      setWorktreeLoadingCwd(null);
       return;
     }
     let cancelled = false;
-    setWorktreeLoadingCwd(selectedCwd);
     fetch(`/api/worktrees?cwd=${encodeURIComponent(selectedCwd)}`)
       .then((r) => r.json())
       .then((d: { projectRoot?: string; projectKey?: string; isGit?: boolean; isTopLevel?: boolean; currentWorktreePath?: string | null; worktrees?: WorktreeEntry[]; error?: string }) => {
         if (cancelled) return;
-        setWorktreeLoadingCwd(null);
         if (d.error || !d.projectRoot) {
           setWorktreeState(null);
           return;
@@ -687,10 +458,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
         });
       })
       .catch(() => {
-        if (!cancelled) {
-          setWorktreeLoadingCwd(null);
-          setWorktreeState(null);
-        }
+        if (!cancelled) setWorktreeState(null);
       });
     return () => { cancelled = true; };
   }, [selectedCwd, wtRefreshKey, refreshKey]);
@@ -759,7 +527,6 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
       setSelectedCwd(data.cwd);
       setCustomPathOpen(false);
       setCustomPathValue("");
-      setDropdownOpen(false);
     } catch (e) {
       setCustomPathError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -770,22 +537,6 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   const handleCustomPathClick = useCallback(() => {
     setCustomPathOpen(true);
     setCustomPathError(null);
-    setDropdownOpen(false);
-  }, []);
-  const handleDefaultCwd = useCallback(async () => {
-    try {
-      const res = await fetch("/api/default-cwd", { method: "POST" });
-      const data = await res.json() as { cwd?: string; error?: string };
-      if (data.cwd) {
-        setSelectedCwd(data.cwd);
-        setCustomPathOpen(false);
-        setCustomPathValue("");
-        setCustomPathError(null);
-        setDropdownOpen(false);
-      }
-    } catch {
-      // ignore
-    }
   }, []);
 
   const handleCreateWorktree = useCallback(async () => {
@@ -858,17 +609,12 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   // Close dropdowns on outside click
   useEffect(() => {
     const handler = (e: MouseEvent) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
-        setDropdownOpen(false);
-        setProjectFilter("");
-      }
       if (wtDropdownRef.current && !wtDropdownRef.current.contains(e.target as Node)) {
         setWtDropdownOpen(false);
         setWtNewOpen(false);
         setWtNewBranch("");
         setWtError(null);
         setWtConfirmRemove(null);
-        setWtFilter("");
       }
     };
     document.addEventListener("mousedown", handler);
@@ -895,10 +641,6 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   }, [selectedCwd, onNewSession]);
 
   const recentProjects = getRecentProjects(allSessions);
-  const showProjectFilter = recentProjects.length > 8;
-  const visibleProjects = projectFilter.trim()
-    ? recentProjects.filter((project) => project.root.toLowerCase().includes(projectFilter.trim().toLowerCase()))
-    : recentProjects;
 
   // Sessions of every worktree in the selected project are shown together
   const selectedProject = projectFor(selectedCwd);
@@ -910,50 +652,12 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
     [allSessions, runningSessionIds, unreadSessionIds],
   );
 
-  // Any activity in a project other than the one currently selected — shown as
-  // a dot on the (collapsed) selector button so it is visible without opening
-  // the dropdown.
-  const hasOtherWorkspaceActivity = useMemo(
-    () => [...projectActivity.entries()].some(
-      ([key, { running, unread }]) => key !== selectedProject?.key && (running > 0 || unread > 0),
-    ),
-    [projectActivity, selectedProject],
-  );
-
-  const filteredSessions = selectedProject
-    ? sessionsForProject(allSessions, selectedProject.key)
-    : allSessions;
   const showWorktreeSwitcher = Boolean(
     worktreeState?.isGit
     && worktreeState.isTopLevel
     && selectedCwd
     && selectedProject?.key === worktreeState.projectKey
   );
-  const worktreeGuide = selectedCwd
-    && worktreeState
-    && selectedProject?.key === worktreeState.projectKey
-    && !showWorktreeSwitcher
-    ? (worktreeState.isGit
-        ? {
-             label: t("sidebar.openRepoRoot"),
-             title: t("sidebar.openRepoRootTitle"),
-          }
-        : {
-             label: t("sidebar.gitRepoRootOnly"),
-             title: t("sidebar.gitRepoRootOnlyTitle"),
-          })
-    : null;
-  const worktreeLoading = Boolean(selectedCwd && worktreeLoadingCwd === selectedCwd);
-  const inactiveWorktreeSelector = worktreeGuide
-    ?? (worktreeLoading && !showWorktreeSwitcher
-      ? {
-           label: t("sidebar.worktrees"),
-           title: t("sidebar.checkingWorktrees"),
-        }
-      : null);
-
-  // Build parent-child tree within the filtered set
-  const sessionTree = buildSessionTree(filteredSessions);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
@@ -976,72 +680,84 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
           flexShrink: 0,
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
-          <PiWebTitle />
-          <div style={{ display: "flex", gap: 6 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
             <button
               onClick={handleNewSession}
               disabled={!selectedCwd}
               style={{
-                display: "flex", alignItems: "center", justifyContent: "center", gap: 5,
-                background: "var(--bg-hover)",
-                border: "1px solid var(--border)",
-                color: selectedCwd ? "var(--text-muted)" : "var(--text-dim)",
+                display: "flex", alignItems: "center", justifyContent: "flex-start", gap: 8,
+                flex: 1,
+                minWidth: 0,
+                background: "transparent",
+                border: "none",
+                color: selectedCwd ? "var(--text)" : "var(--text-dim)",
                 cursor: selectedCwd ? "pointer" : "not-allowed",
-                height: 32,
-                paddingLeft: 10,
-                paddingRight: 12,
-                borderRadius: 7,
-                fontSize: 12,
+                height: 34,
+                paddingLeft: 8,
+                paddingRight: 10,
+                borderRadius: 8,
+                fontSize: 13,
                 fontWeight: 500,
                 letterSpacing: "-0.01em",
-                flexShrink: 0,
-                transition: "background 0.12s, color 0.12s, border-color 0.12s",
+                transition: "background 0.12s, color 0.12s",
               }}
              title={selectedCwd ? t("sidebar.newSessionTitle", { path: selectedCwd }) : t("sidebar.selectProject")}
               onMouseEnter={(e) => {
                 if (!selectedCwd) return;
-                e.currentTarget.style.background = "var(--bg-selected)";
-                e.currentTarget.style.color = "var(--accent)";
-                e.currentTarget.style.borderColor = "rgba(37,99,235,0.35)";
+                e.currentTarget.style.background = "var(--bg-hover)";
               }}
               onMouseLeave={(e) => {
-                e.currentTarget.style.background = "var(--bg-hover)";
-                e.currentTarget.style.color = selectedCwd ? "var(--text-muted)" : "var(--text-dim)";
-                e.currentTarget.style.borderColor = "var(--border)";
+                e.currentTarget.style.background = "transparent";
               }}
             >
-              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
-                <line x1="6" y1="1" x2="6" y2="11" />
-                <line x1="1" y1="6" x2="11" y2="6" />
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M12 20h9" />
+                <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" />
               </svg>
-              {t("sidebar.new")}
+              {t("sidebar.newConversation")}
+            </button>
+            <button
+              type="button"
+              onClick={handleCustomPathClick}
+              title={t("sidebar.customPath")}
+              aria-label={t("sidebar.customPath")}
+              style={{
+                display: "flex", alignItems: "center", justifyContent: "center",
+                width: 32, height: 32, padding: 0, flexShrink: 0,
+                background: "transparent", border: "none", borderRadius: 8,
+                color: "var(--text-muted)", cursor: "pointer",
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; e.currentTarget.style.color = "var(--text)"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "var(--text-muted)"; }}
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
+                <path d="M12 11v5M9.5 13.5h5" />
+              </svg>
             </button>
             <button
               onClick={() => loadSessions(false, true)}
               style={{
                 display: "flex", alignItems: "center", justifyContent: "center",
-                background: sessionRefreshDone ? "rgba(74,222,128,0.18)" : "var(--bg-hover)",
-                border: `1px solid ${sessionRefreshDone ? "rgba(74,222,128,0.4)" : "var(--border)"}`,
+                background: sessionRefreshDone ? "rgba(74,222,128,0.18)" : "transparent",
+                border: "none",
                 color: sessionRefreshDone ? "#4ade80" : "var(--text-muted)",
                 cursor: "pointer",
                 width: 32, height: 32,
-                borderRadius: 7,
+                borderRadius: 8,
                 padding: 0,
                 flexShrink: 0,
-                transition: "background 0.3s, color 0.3s, border-color 0.3s",
+                transition: "background 0.3s, color 0.3s",
               }}
               onMouseEnter={(e) => {
                 if (sessionRefreshDone) return;
-                e.currentTarget.style.background = "var(--bg-selected)";
-                e.currentTarget.style.color = "var(--accent)";
-                e.currentTarget.style.borderColor = "rgba(37,99,235,0.35)";
+                e.currentTarget.style.background = "var(--bg-hover)";
+                e.currentTarget.style.color = "var(--text)";
               }}
               onMouseLeave={(e) => {
                 if (sessionRefreshDone) return;
-                e.currentTarget.style.background = "var(--bg-hover)";
+                e.currentTarget.style.background = "transparent";
                 e.currentTarget.style.color = "var(--text-muted)";
-                e.currentTarget.style.borderColor = "var(--border)";
               }}
                title={t("sidebar.refresh")}
             >
@@ -1056,566 +772,8 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
                 </svg>
               )}
             </button>
-          </div>
         </div>
 
-        {/* CWD picker */}
-        <div ref={dropdownRef} style={{ position: "relative" }}>
-          <button
-            onClick={() => setDropdownOpen((v) => !v)}
-            title={selectedProject?.root ?? selectedCwd ?? ""}
-            style={{
-              width: "100%",
-              display: "flex",
-              alignItems: "center",
-              padding: "6px 10px",
-              background: selectedCwd ? "var(--bg-hover)" : "rgba(37,99,235,0.06)",
-              border: selectedCwd ? "1px solid var(--border)" : "1px solid rgba(37,99,235,0.4)",
-              borderRadius: 7,
-              cursor: "pointer",
-              fontSize: 12,
-              color: "var(--text)",
-              textAlign: "left",
-              transition: "border-color 0.15s, background 0.15s",
-            }}
-          >
-            {selectedCwd ? (
-              <PathLabel
-                text={displayCwd(selectedProject?.root ?? selectedCwd, homeDir)}
-                style={{
-                  flex: 1,
-                  fontFamily: "var(--font-mono)",
-                  fontSize: 11,
-                  color: "var(--text)",
-                }}
-              />
-            ) : (
-              <span
-                style={{
-                  flex: 1,
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                  fontFamily: "var(--font-mono)",
-                  fontSize: 11,
-                  color: "var(--text-dim)",
-                }}
-              >
-                 {initialSessionId && !restoredRef.current ? "" : t("sidebar.selectProject")}
-              </span>
-            )}
-            {hasOtherWorkspaceActivity && (
-              <span
-                title={t("sidebar.newActivity")}
-                aria-label={t("sidebar.newActivity")}
-                style={{
-                  width: 8,
-                  height: 8,
-                  borderRadius: "50%",
-                  flexShrink: 0,
-                  marginLeft: 6,
-                  background: "var(--accent)",
-                }}
-              />
-            )}
-          </button>
-
-          <AnimatedDropdown
-            open={dropdownOpen}
-            style={{
-              position: "absolute",
-              top: "calc(100% + 4px)",
-              left: 0,
-              right: 0,
-              zIndex: 100,
-              background: "var(--bg)",
-              border: "1px solid var(--border)",
-              borderRadius: 8,
-              boxShadow: "0 6px 20px rgba(0,0,0,0.10)",
-              overflow: "hidden",
-            }}
-          >
-              {showProjectFilter && (
-                <div style={{ padding: "6px 8px", borderBottom: "1px solid var(--border)" }}>
-                  <input
-                    value={projectFilter}
-                    onChange={(e) => setProjectFilter(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Escape") {
-                        setProjectFilter("");
-                        setDropdownOpen(false);
-                      }
-                    }}
-                     placeholder={t("sidebar.filterProjects")}
-                    autoFocus
-                    style={{
-                      width: "100%",
-                      fontSize: 11,
-                      fontFamily: "var(--font-mono)",
-                      padding: "5px 8px",
-                      border: "1px solid var(--border)",
-                      borderRadius: 5,
-                      outline: "none",
-                      background: "var(--bg)",
-                      color: "var(--text)",
-                      boxSizing: "border-box",
-                    }}
-                  />
-                </div>
-              )}
-              <div style={{ maxHeight: "min(50vh, 380px)", overflowY: "auto" }}>
-                {visibleProjects.map((project) => (
-                  <button
-                    key={project.key}
-                    onClick={() => {
-                      setSelectedCwd(project.root);
-                      setProjectFilter("");
-                      setCustomPathOpen(false);
-                      setCustomPathValue("");
-                      setCustomPathError(null);
-                      setDropdownOpen(false);
-                    }}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 7,
-                      width: "100%",
-                      padding: "8px 10px",
-                      background: "var(--bg)",
-                      border: "none",
-                      borderBottom: "1px solid var(--border)",
-                      color: project.key === selectedProject?.key ? "var(--text)" : "var(--text-muted)",
-                      cursor: "pointer",
-                      textAlign: "left",
-                      fontSize: 11,
-                      fontFamily: "var(--font-mono)",
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                    }}
-                    title={project.root}
-                  >
-                    {project.key === selectedProject?.key && (
-                      <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="var(--accent)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
-                        <polyline points="1.5 5 4 7.5 8.5 2.5" />
-                      </svg>
-                    )}
-                    {project.key !== selectedProject?.key && <span style={{ width: 10, flexShrink: 0 }} />}
-                    <PathLabel text={displayCwd(project.root, homeDir)} style={{ flex: 1 }} />
-                    {showProjectActivity(projectActivity.get(project.key), t)}
-                  </button>
-                ))}
-                {visibleProjects.length === 0 && projectFilter.trim() && (
-                   <div style={{ padding: "8px 10px", fontSize: 11, color: "var(--text-dim)" }}>{t("sidebar.noMatchingProjects")}</div>
-                )}
-              </div>
-
-              {/* Default cwd shortcut */}
-              {!customPathOpen && (
-                <button
-                  onClick={(e) => { e.stopPropagation(); handleDefaultCwd(); }}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 7,
-                    width: "100%",
-                    padding: "8px 10px",
-                    background: "none",
-                    border: "none",
-                    borderTop: visibleProjects.length > 0 ? "1px solid var(--border)" : "none",
-                    color: "var(--text-muted)",
-                    cursor: "pointer",
-                    textAlign: "left",
-                    fontSize: 11,
-                  }}
-                >
-                  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
-                    <path d="M1 3A1 1 0 0 1 2 2H4L5 3.5H8.5a.5.5 0 0 1 .5.5v4a.5.5 0 0 1-.5.5h-7A.5.5 0 0 1 1 8V3Z" />
-                  </svg>
-                   <span>{t("sidebar.useDefaultDirectory")}</span>
-                </button>
-              )}
-
-              {/* Custom path directory picker */}
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  handleCustomPathClick();
-                }}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 7,
-                  width: "100%",
-                  padding: "8px 10px",
-                  background: "none",
-                  border: "none",
-                  color: "var(--text-muted)",
-                  cursor: "pointer",
-                  textAlign: "left",
-                  fontSize: 11,
-                }}
-              >
-                <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" style={{ flexShrink: 0 }}>
-                  <line x1="5" y1="1" x2="5" y2="9" />
-                  <line x1="1" y1="5" x2="9" y2="5" />
-                </svg>
-                <span>{t("sidebar.customPath")}</span>
-              </button>
-          </AnimatedDropdown>
-        </div>
-
-        {/* Worktree switcher — shown only for git projects at a checkout top
-            level (repo subdirs keep their own project identity, so switching
-            from them would jump projects). Rendered whenever the selected cwd
-            belongs to the loaded project (not just when forCwd matches), so
-            switching between worktrees of one project keeps the row mounted
-            instead of flickering while data refetches: all worktrees of a
-            project share the same list anyway. */}
-        {showWorktreeSwitcher && (() => {
-          if (!worktreeState) return null;
-          const showWtFilter = worktreeState.worktrees.length >= 8;
-          const visibleWorktrees = showWtFilter && wtFilter.trim()
-            ? worktreeState.worktrees.filter((w) =>
-                (w.branch ?? displayCwd(w.path, homeDir)).toLowerCase().includes(wtFilter.trim().toLowerCase()))
-            : worktreeState.worktrees;
-          return (
-            <div ref={wtDropdownRef} style={{ position: "relative", marginTop: 6 }}>
-              <button
-                onClick={() => setWtDropdownOpen((v) => !v)}
-                 title={currentWorktree ? t("sidebar.switchWorktreeTitle", { path: currentWorktree.path }) : t("sidebar.switchWorktree")}
-                style={{
-                  width: "100%",
-                  height: 29,
-                  boxSizing: "border-box",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 6,
-                  padding: "0 10px",
-                  background: "var(--bg-hover)",
-                  border: "1px solid var(--border)",
-                  borderRadius: 7,
-                  cursor: "pointer",
-                  fontSize: 11,
-                  lineHeight: 1.35,
-                  color: "var(--text-muted)",
-                  textAlign: "left",
-                }}
-              >
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0, color: currentWorktree && !currentWorktree.isMain ? "var(--accent)" : "var(--text-dim)" }}>
-                  <line x1="6" y1="3" x2="6" y2="15" />
-                  <circle cx="18" cy="6" r="3" />
-                  <circle cx="6" cy="18" r="3" />
-                  <path d="M18 9a9 9 0 0 1-9 9" />
-                </svg>
-                <PathLabel
-                  text={currentWorktree ? (currentWorktree.branch ?? displayCwd(currentWorktree.path, homeDir)) : "…"}
-                  style={{ flex: 1, fontFamily: "var(--font-mono)", color: "var(--text)" }}
-                />
-                {currentWorktree?.isMain && (
-                   <span style={{ flexShrink: 0, color: "var(--text-dim)", fontSize: 10 }}>{t("sidebar.main")}</span>
-                )}
-                {worktreeState.worktrees.length > 1 && (
-                  <span style={{ flexShrink: 0, color: "var(--text-dim)", fontSize: 10 }}>
-                    {worktreeState.worktrees.length}
-                  </span>
-                )}
-                <svg width="9" height="9" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
-                  <polyline points="2 3.5 5 6.5 8 3.5" />
-                </svg>
-              </button>
-
-              <AnimatedDropdown
-                open={wtDropdownOpen}
-                style={{
-                  position: "absolute",
-                  top: "calc(100% + 4px)",
-                  left: 0,
-                  right: 0,
-                  zIndex: 100,
-                  background: "var(--bg)",
-                  border: "1px solid var(--border)",
-                  borderRadius: 8,
-                  boxShadow: "0 6px 20px rgba(0,0,0,0.10)",
-                  overflow: "hidden",
-                }}
-              >
-                  {showWtFilter && (
-                    <div style={{ padding: "6px 8px", borderBottom: "1px solid var(--border)" }}>
-                      <input
-                        value={wtFilter}
-                        onChange={(e) => setWtFilter(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Escape") {
-                            setWtFilter("");
-                            setWtDropdownOpen(false);
-                          }
-                        }}
-                        placeholder={t("sidebar.filterWorktrees")}
-                        autoFocus
-                        style={{
-                          width: "100%",
-                          fontSize: 11,
-                          fontFamily: "var(--font-mono)",
-                          padding: "5px 8px",
-                          border: "1px solid var(--border)",
-                          borderRadius: 5,
-                          outline: "none",
-                          background: "var(--bg)",
-                          color: "var(--text)",
-                          boxSizing: "border-box",
-                        }}
-                      />
-                    </div>
-                  )}
-                  <div style={{ maxHeight: "min(40vh, 300px)", overflowY: "auto" }}>
-                    {visibleWorktrees.map((wt) => {
-                      const isCurrent = wt.path === currentWorktreePath;
-                      if (wtConfirmRemove === wt.path) {
-                        return (
-                          <div key={wt.path} style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 10px", borderBottom: "1px solid var(--border)", background: "rgba(239,68,68,0.06)" }}>
-                            <span style={{ flex: 1, fontSize: 11, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                              {t("sidebar.forceRemoveCheckout")}
-                            </span>
-                            <button
-                              onClick={() => void handleRemoveWorktree(wt.path, true)}
-                              disabled={wtBusy}
-                              style={{ padding: "3px 9px", background: "#ef4444", border: "none", borderRadius: 5, color: "#fff", fontSize: 11, fontWeight: 600, cursor: "pointer", flexShrink: 0 }}
-                            >
-                              {t("sidebar.force")}
-                            </button>
-                            <button
-                              onClick={() => setWtConfirmRemove(null)}
-                              style={{ padding: "3px 9px", background: "var(--bg-hover)", border: "1px solid var(--border)", borderRadius: 5, color: "var(--text-muted)", fontSize: 11, cursor: "pointer", flexShrink: 0 }}
-                            >
-                              {t("sidebar.cancel")}
-                            </button>
-                          </div>
-                        );
-                      }
-                      return (
-                        <div
-                          key={wt.path}
-                          className="wt-row"
-                          style={{ display: "flex", alignItems: "center", borderBottom: "1px solid var(--border)" }}
-                        >
-                          <button
-                            onClick={() => {
-                              setSelectedCwd(wt.path);
-                              setWtDropdownOpen(false);
-                              setWtError(null);
-                              setWtFilter("");
-                            }}
-                            title={wt.path}
-                            style={{
-                              flex: 1,
-                              minWidth: 0,
-                              display: "flex",
-                              alignItems: "center",
-                              gap: 7,
-                              padding: "8px 10px",
-                              background: "var(--bg)",
-                              border: "none",
-                              color: isCurrent ? "var(--text)" : "var(--text-muted)",
-                              cursor: "pointer",
-                              textAlign: "left",
-                              fontSize: 11,
-                              fontFamily: "var(--font-mono)",
-                            }}
-                          >
-                            {isCurrent ? (
-                              <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="var(--accent)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
-                                <polyline points="1.5 5 4 7.5 8.5 2.5" />
-                              </svg>
-                            ) : (
-                              <span style={{ width: 10, flexShrink: 0 }} />
-                            )}
-                            <PathLabel text={wt.branch ?? displayCwd(wt.path, homeDir)} style={{ flex: 1 }} />
-                            {wt.isMain && <span style={{ flexShrink: 0, color: "var(--text-dim)", fontSize: 10 }}>{t("sidebar.main")}</span>}
-                          </button>
-                          {!wt.isMain && (
-                            <button
-                              onClick={() => void handleRemoveWorktree(wt.path, false)}
-                              disabled={wtBusy}
-                               title={t("sidebar.removeWorktreeTitle", { path: wt.path })}
-                              style={{
-                                display: "flex", alignItems: "center", justifyContent: "center",
-                                width: 34, height: 28, padding: 0, marginRight: 4,
-                                background: "none", border: "none",
-                                color: "var(--text-dim)", cursor: "pointer",
-                                borderRadius: 5, flexShrink: 0,
-                                transition: "color 0.12s, background 0.12s",
-                              }}
-                              onMouseEnter={(e) => { e.currentTarget.style.color = "#ef4444"; e.currentTarget.style.background = "rgba(239,68,68,0.08)"; }}
-                              onMouseLeave={(e) => { e.currentTarget.style.color = "var(--text-dim)"; e.currentTarget.style.background = "none"; }}
-                            >
-                              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                <polyline points="3 6 5 6 21 6" />
-                                <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
-                                <path d="M10 11v6M14 11v6" />
-                                <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
-                              </svg>
-                            </button>
-                          )}
-                        </div>
-                      );
-                    })}
-                    {showWtFilter && visibleWorktrees.length === 0 && wtFilter.trim() && (
-                      <div style={{ padding: "8px 10px", fontSize: 11, color: "var(--text-dim)" }}>{t("sidebar.noMatchingWorktrees")}</div>
-                    )}
-                  </div>
-
-                  {!wtNewOpen ? (
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setWtNewOpen(true);
-                        setWtError(null);
-                        setTimeout(() => wtNewInputRef.current?.focus(), 0);
-                      }}
-                      title={t("sidebar.createWorktreeTitle")}
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 7,
-                        width: "100%",
-                        padding: "8px 10px",
-                        background: "none",
-                        border: "none",
-                        color: "var(--text-muted)",
-                        cursor: "pointer",
-                        textAlign: "left",
-                        fontSize: 11,
-                      }}
-                    >
-                      <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" style={{ flexShrink: 0 }}>
-                        <line x1="5" y1="1" x2="5" y2="9" />
-                        <line x1="1" y1="5" x2="9" y2="5" />
-                      </svg>
-                       <span>{t("sidebar.newWorktree")}</span>
-                    </button>
-                  ) : (
-                    <div style={{ padding: "6px 8px" }}>
-                      <input
-                        ref={wtNewInputRef}
-                        value={wtNewBranch}
-                        onChange={(e) => {
-                          setWtNewBranch(e.target.value);
-                          setWtError(null);
-                        }}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") {
-                            e.preventDefault();
-                            void handleCreateWorktree();
-                          }
-                          if (e.key === "Escape") {
-                            setWtNewOpen(false);
-                            setWtNewBranch("");
-                            setWtError(null);
-                          }
-                        }}
-                         placeholder={t("sidebar.branchName")}
-                        style={{
-                          width: "100%",
-                          fontSize: 11,
-                          fontFamily: "var(--font-mono)",
-                          padding: "5px 8px",
-                          border: "1px solid var(--accent)",
-                          borderRadius: 5,
-                          outline: "none",
-                          background: "var(--bg)",
-                          color: "var(--text)",
-                          boxSizing: "border-box",
-                        }}
-                      />
-                      <div style={{ display: "flex", gap: 5, marginTop: 5 }}>
-                        <button
-                          onClick={() => void handleCreateWorktree()}
-                          disabled={wtBusy || !wtNewBranch.trim()}
-                          style={{
-                            flex: 1,
-                            padding: "4px 0",
-                            background: "var(--accent)",
-                            border: "none",
-                            borderRadius: 5,
-                            color: "#fff",
-                            fontSize: 11,
-                            fontWeight: 600,
-                            cursor: wtBusy || !wtNewBranch.trim() ? "not-allowed" : "pointer",
-                            opacity: wtBusy || !wtNewBranch.trim() ? 0.65 : 1,
-                          }}
-                        >
-                           {wtBusy ? t("sidebar.creating") : t("sidebar.create")}
-                        </button>
-                        <button
-                          onClick={() => { setWtNewOpen(false); setWtNewBranch(""); setWtError(null); }}
-                          style={{
-                            flex: 1,
-                            padding: "4px 0",
-                            background: "var(--bg-hover)",
-                            border: "1px solid var(--border)",
-                            borderRadius: 5,
-                            color: "var(--text-muted)",
-                            fontSize: 11,
-                            cursor: "pointer",
-                          }}
-                        >
-                           {t("sidebar.cancel")}
-                        </button>
-                      </div>
-                    </div>
-                  )}
-                  {wtError && (
-                    <div style={{
-                      padding: "5px 10px 8px",
-                      color: "#dc2626",
-                      fontSize: 11,
-                      lineHeight: 1.35,
-                      overflowWrap: "anywhere",
-                    }}>
-                      {wtError}
-                    </div>
-                  )}
-              </AnimatedDropdown>
-            </div>
-          );
-        })()}
-        {inactiveWorktreeSelector && (
-          <button
-            type="button"
-            aria-disabled="true"
-            tabIndex={-1}
-            title={inactiveWorktreeSelector.title}
-            style={{
-              width: "100%",
-              height: 29,
-              boxSizing: "border-box",
-              marginTop: 6,
-              display: "flex",
-              alignItems: "center",
-              gap: 6,
-              padding: "0 10px",
-              border: "1px solid var(--border)",
-              borderRadius: 7,
-              background: "var(--bg-hover)",
-              color: "var(--text-dim)",
-              fontSize: 11,
-              lineHeight: 1.35,
-              whiteSpace: "nowrap",
-              textAlign: "left",
-              cursor: "default",
-              opacity: 0.82,
-            }}
-          >
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
-              <line x1="6" y1="3" x2="6" y2="15" />
-              <circle cx="18" cy="6" r="3" />
-              <circle cx="6" cy="18" r="3" />
-              <path d="M18 9a9 9 0 0 1-9 9" />
-            </svg>
-            <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{inactiveWorktreeSelector.label}</span>
-          </button>
-        )}
       </div>
 
       {/* Session list */}
@@ -1630,27 +788,251 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
             {error}
           </div>
         )}
-        {!loading && !error && filteredSessions.length === 0 && (
+        {!loading && !error && allSessions.length === 0 && (
           <div style={{ padding: "16px 14px", color: "var(--text-muted)", fontSize: 12 }}>
             {t("sidebar.noSessions")}
           </div>
         )}
-        {sessionTree.map((node) => (
-          <SessionTreeItem
-            key={node.session.id}
-            node={node}
-            selectedSessionId={selectedSessionId}
-            runningSessionIds={runningSessionIds}
-            unreadSessionIds={unreadSessionIds}
-            onSelectSession={handleSelectSessionFromList}
-            onRenamed={loadSessions}
-            onSessionDeleted={(id) => {
-              onSessionDeleted?.(id);
-              loadSessions();
-            }}
-            depth={0}
-          />
-        ))}
+        {!loading && !error && recentProjects.map((project) => {
+          const projectSessions = sessionsForProject(allSessions, project.key)
+            .slice()
+            .sort((a, b) => b.modified.localeCompare(a.modified));
+          if (projectSessions.length === 0) return null;
+          const selectedIndex = projectSessions.findIndex((session) => session.id === selectedSessionId);
+          const userExpanded = expandedProjectKeys.has(project.key);
+          const expanded = userExpanded || selectedIndex >= COLLAPSED_SESSION_LIMIT;
+          const visibleSessions = expanded || projectSessions.length <= COLLAPSED_SESSION_LIMIT
+            ? projectSessions
+            : projectSessions.slice(0, COLLAPSED_SESSION_LIMIT);
+          const hiddenCount = projectSessions.length - visibleSessions.length;
+          const projectIsSelected = project.key === selectedProject?.key;
+          const canManageWorktrees = projectIsSelected && showWorktreeSwitcher && worktreeState;
+          return (
+            <div key={project.key} style={{ padding: "4px 0 8px" }}>
+              <div style={{ display: "flex", alignItems: "center" }}>
+                <button
+                  type="button"
+                  onClick={() => setSelectedCwd(project.root)}
+                  title={project.root}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    flex: 1,
+                    minWidth: 0,
+                    padding: "6px 6px 6px 12px",
+                    background: "none",
+                    border: "none",
+                    color: projectIsSelected ? "var(--text)" : "var(--text-muted)",
+                    cursor: "pointer",
+                    textAlign: "left",
+                    fontSize: 13,
+                    fontWeight: 500,
+                  }}
+                >
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
+                    <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
+                  </svg>
+                  <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {projectFolderName(project.root)}
+                  </span>
+                  {showProjectActivity(projectActivity.get(project.key), t)}
+                </button>
+                {canManageWorktrees && (
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setWtDropdownOpen((open) => !open);
+                    }}
+                    title={t("sidebar.worktrees")}
+                    aria-label={t("sidebar.worktrees")}
+                    style={{
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                      width: 28, height: 28, marginRight: 6, padding: 0,
+                      background: wtDropdownOpen ? "var(--bg-hover)" : "none",
+                      border: "none", borderRadius: 6,
+                      color: currentWorktree && !currentWorktree.isMain ? "var(--accent)" : "var(--text-dim)",
+                      cursor: "pointer", flexShrink: 0,
+                    }}
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                      <line x1="6" y1="3" x2="6" y2="15" />
+                      <circle cx="18" cy="6" r="3" />
+                      <circle cx="6" cy="18" r="3" />
+                      <path d="M18 9a9 9 0 0 1-9 9" />
+                    </svg>
+                  </button>
+                )}
+              </div>
+              {canManageWorktrees && wtDropdownOpen && (
+                <div
+                  ref={wtDropdownRef}
+                  style={{
+                    margin: "2px 8px 6px 34px",
+                    border: "1px solid var(--border)",
+                    borderRadius: 8,
+                    overflow: "hidden",
+                    background: "var(--bg)",
+                  }}
+                >
+                  {worktreeState.worktrees.map((wt) => {
+                    const isCurrent = wt.path === currentWorktreePath;
+                    return (
+                      <div key={wt.path} style={{ display: "flex", alignItems: "center" }}>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSelectedCwd(wt.path);
+                            setWtDropdownOpen(false);
+                            setWtError(null);
+                          }}
+                          title={wt.path}
+                          style={{
+                            display: "flex", alignItems: "center", gap: 7,
+                            flex: 1, minWidth: 0, padding: "7px 8px",
+                            background: isCurrent ? "var(--bg-selected)" : "none",
+                            border: "none", color: "var(--text-muted)",
+                            cursor: "pointer", textAlign: "left", fontSize: 11,
+                          }}
+                        >
+                          <span style={{ width: 10, color: "var(--accent)", flexShrink: 0 }}>{isCurrent ? "✓" : ""}</span>
+                          <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {wt.branch ?? projectFolderName(wt.path)}
+                          </span>
+                          {wt.isMain && <span style={{ color: "var(--text-dim)", fontSize: 10 }}>{t("sidebar.main")}</span>}
+                        </button>
+                        {!wt.isMain && wtConfirmRemove !== wt.path && (
+                          <button
+                            type="button"
+                            onClick={() => void handleRemoveWorktree(wt.path, false)}
+                            disabled={wtBusy}
+                            title={t("sidebar.removeWorktreeTitle", { path: wt.path })}
+                            style={{
+                              display: "flex", alignItems: "center", justifyContent: "center",
+                              width: 28, height: 28, marginRight: 4, padding: 0,
+                              background: "none", border: "none", borderRadius: 5,
+                              color: "var(--text-dim)", cursor: "pointer",
+                            }}
+                          >
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                              <path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v5M14 11v5" />
+                            </svg>
+                          </button>
+                        )}
+                        {wtConfirmRemove === wt.path && (
+                          <div style={{ display: "flex", gap: 3, marginRight: 4 }}>
+                            <button type="button" onClick={() => void handleRemoveWorktree(wt.path, true)} disabled={wtBusy} style={{ padding: "3px 6px", border: "none", borderRadius: 4, background: "#ef4444", color: "#fff", fontSize: 10 }}>{t("sidebar.force")}</button>
+                            <button type="button" onClick={() => setWtConfirmRemove(null)} style={{ padding: "3px 6px", border: "1px solid var(--border)", borderRadius: 4, background: "var(--bg)", color: "var(--text-muted)", fontSize: 10 }}>{t("sidebar.cancel")}</button>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                  {!wtNewOpen ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setWtNewOpen(true);
+                        setWtError(null);
+                        setTimeout(() => wtNewInputRef.current?.focus(), 0);
+                      }}
+                      style={{
+                        display: "flex", alignItems: "center", gap: 7,
+                        width: "100%", padding: "7px 8px",
+                        background: "none", border: "none", borderTop: "1px solid var(--border)",
+                        color: "var(--text-muted)", cursor: "pointer", fontSize: 11,
+                      }}
+                    >
+                      <span style={{ width: 10, textAlign: "center" }}>+</span>
+                      {t("sidebar.newWorktree")}
+                    </button>
+                  ) : (
+                    <div style={{ display: "flex", gap: 5, padding: 6, borderTop: "1px solid var(--border)" }}>
+                      <input
+                        ref={wtNewInputRef}
+                        value={wtNewBranch}
+                        onChange={(event) => setWtNewBranch(event.target.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") void handleCreateWorktree();
+                          if (event.key === "Escape") setWtNewOpen(false);
+                        }}
+                        placeholder={t("sidebar.branchName")}
+                        style={{ flex: 1, minWidth: 0, padding: "4px 6px", border: "1px solid var(--border)", borderRadius: 5, background: "var(--bg)", color: "var(--text)", fontSize: 11 }}
+                      />
+                      <button type="button" onClick={() => void handleCreateWorktree()} disabled={wtBusy || !wtNewBranch.trim()} style={{ padding: "4px 8px", border: "none", borderRadius: 5, background: "var(--accent)", color: "#fff", fontSize: 11 }}>
+                        {t("sidebar.create")}
+                      </button>
+                    </div>
+                  )}
+                  {wtError && <div style={{ padding: "5px 8px", color: "#ef4444", fontSize: 11 }}>{wtError}</div>}
+                </div>
+              )}
+              {visibleSessions.map((session) => (
+                <SessionItem
+                  key={session.id}
+                  session={session}
+                  isSelected={session.id === selectedSessionId}
+                  isRunning={runningSessionIds.has(session.id)}
+                  isUnread={unreadSessionIds.has(session.id)}
+                  onClick={() => handleSelectSessionFromList(session)}
+                  onRenamed={loadSessions}
+                  onDeleted={(id) => {
+                    onSessionDeleted?.(id);
+                    loadSessions();
+                  }}
+                  compact
+                />
+              ))}
+              {hiddenCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setExpandedProjectKeys((current) => {
+                    const next = new Set(current);
+                    next.add(project.key);
+                    return next;
+                  })}
+                  style={{
+                    display: "block",
+                    width: "100%",
+                    padding: "4px 12px 4px 35px",
+                    background: "none",
+                    border: "none",
+                    color: "var(--text-dim)",
+                    cursor: "pointer",
+                    textAlign: "left",
+                    fontSize: 12,
+                  }}
+                >
+                  {t("sidebar.showMoreSessions")}
+                </button>
+              )}
+              {userExpanded && projectSessions.length > COLLAPSED_SESSION_LIMIT && hiddenCount === 0 && (
+                <button
+                  type="button"
+                  onClick={() => setExpandedProjectKeys((current) => {
+                    const next = new Set(current);
+                    next.delete(project.key);
+                    return next;
+                  })}
+                  style={{
+                    display: "block",
+                    width: "100%",
+                    padding: "4px 12px 4px 35px",
+                    background: "none",
+                    border: "none",
+                    color: "var(--text-dim)",
+                    cursor: "pointer",
+                    textAlign: "left",
+                    fontSize: 12,
+                  }}
+                >
+                  {t("sidebar.showLessSessions")}
+                </button>
+              )}
+            </div>
+          );
+        })}
       </div>
 
       {/* File Explorer section */}
@@ -1768,77 +1150,6 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
               />
             </div>
           )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function SessionTreeItem({
-  node,
-  selectedSessionId,
-  runningSessionIds,
-  unreadSessionIds,
-  onSelectSession,
-  onRenamed,
-  onSessionDeleted,
-  depth,
-}: {
-  node: SessionTreeNode;
-  selectedSessionId: string | null;
-  runningSessionIds: Set<string>;
-  unreadSessionIds: Set<string>;
-  onSelectSession: (s: SessionInfo) => void;
-  onRenamed?: () => void;
-  onSessionDeleted?: (id: string) => void;
-  depth: number;
-}) {
-  const [collapsed, setCollapsed] = useState(false);
-  const hasChildren = node.children.length > 0;
-
-  return (
-    <div>
-      <div style={{ position: "relative" }}>
-        {/* Indent line for child sessions */}
-        {depth > 0 && (
-          <div style={{
-            position: "absolute",
-            left: depth * 12 + 6,
-            top: 0, bottom: 0,
-            width: 1,
-            background: "var(--border)",
-            pointerEvents: "none",
-          }} />
-        )}
-        <SessionItem
-          session={node.session}
-          isSelected={node.session.id === selectedSessionId}
-          isRunning={runningSessionIds.has(node.session.id)}
-          isUnread={unreadSessionIds.has(node.session.id)}
-          onClick={() => onSelectSession(node.session)}
-          onRenamed={onRenamed}
-          onDeleted={(id) => onSessionDeleted?.(id)}
-          depth={depth}
-          hasChildren={hasChildren}
-          collapsed={collapsed}
-          onToggleCollapse={() => setCollapsed((v) => !v)}
-        />
-      </div>
-      {hasChildren && !collapsed && (
-        <div>
-          {node.children.map((child) => (
-            <SessionTreeItem
-              key={child.session.id}
-              node={child}
-              selectedSessionId={selectedSessionId}
-              runningSessionIds={runningSessionIds}
-              unreadSessionIds={unreadSessionIds}
-              onSelectSession={onSelectSession}
-              onRenamed={onRenamed}
-              onSessionDeleted={onSessionDeleted}
-              depth={depth + 1}
-            />
-          ))}
         </div>
       )}
     </div>
@@ -1963,6 +1274,7 @@ function SessionItem({
   depth = 0,
   hasChildren = false,
   collapsed = false,
+  compact = false,
   onToggleCollapse,
 }: {
   session: SessionInfo;
@@ -1975,6 +1287,7 @@ function SessionItem({
   depth?: number;
   hasChildren?: boolean;
   collapsed?: boolean;
+  compact?: boolean;
   onToggleCollapse?: () => void;
 }) {
   const { t } = useI18n();
@@ -2073,8 +1386,10 @@ function SessionItem({
     e.stopPropagation();
   }, [onRenamed, session.cwd, session.id, session.name, session.path]);
 
-  // Fixed-height outer wrapper — content swaps in place so the list never reflows
-  const ITEM_HEIGHT = 54;
+  const preview = compact && isSelected && displayFirstMessage && displayFirstMessage !== title
+    ? displayFirstMessage
+    : null;
+  const ITEM_HEIGHT = compact ? undefined : 54;
 
   return (
     <div
@@ -2084,17 +1399,25 @@ function SessionItem({
       onMouseLeave={() => { setHovered(false); }}
       style={{
         height: ITEM_HEIGHT,
+        minHeight: compact ? 32 : ITEM_HEIGHT,
+        position: "relative",
         display: "flex",
-        alignItems: "center",
-        paddingLeft: depth > 0 ? depth * 12 + 14 : 14,
-        paddingRight: 8,
+        alignItems: compact ? "flex-start" : "center",
+        paddingTop: compact ? 6 : 0,
+        paddingBottom: compact ? 6 : 0,
+        paddingLeft: compact ? 35 : depth > 0 ? depth * 12 + 14 : 14,
+        paddingRight: compact ? 62 : 8,
+        margin: compact ? "1px 8px" : 0,
+        borderRadius: compact ? 8 : 0,
         cursor: confirmDelete || renaming ? "default" : "pointer",
         background: confirmDelete
           ? "rgba(239,68,68,0.06)"
           : isSelected ? "var(--bg-selected)" : hovered ? "var(--bg-hover)" : "transparent",
-        borderLeft: confirmDelete
-          ? "2px solid #ef4444"
-          : isSelected ? "2px solid var(--accent)" : "2px solid transparent",
+        borderLeft: compact
+          ? "none"
+          : confirmDelete
+            ? "2px solid #ef4444"
+            : isSelected ? "2px solid var(--accent)" : "2px solid transparent",
         transition: "background 0.1s",
         opacity: deleting ? 0.5 : 1,
         gap: 6,
@@ -2185,17 +1508,26 @@ function SessionItem({
                 alignItems: "center",
                 gap: 5,
                 minWidth: 0,
-                fontSize: 12,
+                fontSize: compact ? 13 : 12,
                 fontWeight: isSelected ? 500 : 400,
                 lineHeight: 1.4,
                 color: "var(--text)",
               }}
               title={title}
             >
+              {compact && (isRunning || isUnread) && (
+                isRunning ? <RunningSessionIndicator /> : <UnreadSessionIndicator />
+              )}
               <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
                 {title}
               </span>
             </div>
+            {preview && (
+              <div style={{ marginTop: 2, color: "var(--text-dim)", fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {preview}
+              </div>
+            )}
+            {!compact && (
             <div style={{ marginTop: 2, display: "flex", alignItems: "center", gap: 8, color: "var(--text-dim)", fontSize: 11, minWidth: 0 }}>
               {isRunning ? (
                 <RunningSessionIndicator />
@@ -2220,6 +1552,7 @@ function SessionItem({
                 </span>
               )}
             </div>
+            )}
           </div>
 
           {/* Collapse toggle — always visible when has children */}
@@ -2244,30 +1577,40 @@ function SessionItem({
 
           {/* Action buttons — shown on hover */}
           {hovered && !session.transient && (
-            <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+            <div style={{
+              display: "flex",
+              gap: compact ? 2 : 4,
+              flexShrink: 0,
+              ...(compact ? {
+                position: "absolute" as const,
+                right: 5,
+                top: "50%",
+                transform: "translateY(-50%)",
+              } : {}),
+            }}>
               <button
                 onClick={startRename}
                 title={t("sidebar.rename")}
                 style={{
                   display: "flex", alignItems: "center", justifyContent: "center",
-                  width: 32, height: 32, padding: 0,
-                  background: "var(--bg-hover)", border: "1px solid var(--border)",
-                  borderRadius: 7, color: "var(--text-muted)",
+                  width: compact ? 24 : 32, height: compact ? 24 : 32, padding: 0,
+                  background: compact ? "transparent" : "var(--bg-hover)", border: compact ? "none" : "1px solid var(--border)",
+                  borderRadius: compact ? 5 : 7, color: "var(--text-muted)",
                   cursor: "pointer", flexShrink: 0,
                   transition: "background 0.12s, color 0.12s, border-color 0.12s",
                 }}
                 onMouseEnter={(e) => {
                   e.currentTarget.style.background = "var(--bg-selected)";
                   e.currentTarget.style.color = "var(--accent)";
-                  e.currentTarget.style.borderColor = "rgba(37,99,235,0.35)";
+                  if (!compact) e.currentTarget.style.borderColor = "rgba(37,99,235,0.35)";
                 }}
                 onMouseLeave={(e) => {
-                  e.currentTarget.style.background = "var(--bg-hover)";
+                  e.currentTarget.style.background = compact ? "transparent" : "var(--bg-hover)";
                   e.currentTarget.style.color = "var(--text-muted)";
-                  e.currentTarget.style.borderColor = "var(--border)";
+                  if (!compact) e.currentTarget.style.borderColor = "var(--border)";
                 }}
               >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <svg width={compact ? 12 : 14} height={compact ? 12 : 14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
                 </svg>
               </button>
@@ -2276,24 +1619,24 @@ function SessionItem({
                 title={t("sidebar.deleteWithShiftClick")}
                 style={{
                   display: "flex", alignItems: "center", justifyContent: "center",
-                  width: 32, height: 32, padding: 0,
-                  background: "var(--bg-hover)", border: "1px solid var(--border)",
-                  borderRadius: 7, color: "var(--text-muted)",
+                  width: compact ? 24 : 32, height: compact ? 24 : 32, padding: 0,
+                  background: compact ? "transparent" : "var(--bg-hover)", border: compact ? "none" : "1px solid var(--border)",
+                  borderRadius: compact ? 5 : 7, color: "var(--text-muted)",
                   cursor: "pointer", flexShrink: 0,
                   transition: "background 0.12s, color 0.12s, border-color 0.12s",
                 }}
                 onMouseEnter={(e) => {
                   e.currentTarget.style.background = "rgba(239,68,68,0.08)";
                   e.currentTarget.style.color = "#ef4444";
-                  e.currentTarget.style.borderColor = "rgba(239,68,68,0.35)";
+                  if (!compact) e.currentTarget.style.borderColor = "rgba(239,68,68,0.35)";
                 }}
                 onMouseLeave={(e) => {
-                  e.currentTarget.style.background = "var(--bg-hover)";
+                  e.currentTarget.style.background = compact ? "transparent" : "var(--bg-hover)";
                   e.currentTarget.style.color = "var(--text-muted)";
-                  e.currentTarget.style.borderColor = "var(--border)";
+                  if (!compact) e.currentTarget.style.borderColor = "var(--border)";
                 }}
               >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <svg width={compact ? 12 : 14} height={compact ? 12 : 14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <polyline points="3 6 5 6 21 6" />
                   <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
                   <path d="M10 11v6M14 11v6" />
