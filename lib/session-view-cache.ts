@@ -14,6 +14,7 @@ export interface SessionViewSnapshot<TData = unknown> {
   entryIds: string[];
   activeLeafId: string | null;
   cachedAt: number;
+  revision?: string;
   ui?: SessionViewUiState;
 }
 
@@ -56,6 +57,7 @@ export function setSessionViewSnapshot<TData>(
   entries.delete(sessionId);
   entries.set(sessionId, {
     ...snapshot,
+    revision: snapshot.revision ?? previous?.revision,
     ui: snapshot.ui ?? previous?.ui,
   } as StoredSnapshot);
   trimCache(entries);

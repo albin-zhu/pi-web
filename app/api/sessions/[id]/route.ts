@@ -14,6 +14,12 @@ import { sessionPathKey } from "@/lib/session-path";
 import { getRpcSession } from "@/lib/rpc-manager";
 import { projectTreeForResponse } from "@/lib/project-tree";
 import { computeSessionTotalActiveMs } from "@/lib/session-timing";
+import {
+  createSessionRevision,
+  getCachedSessionResponse,
+  requestMatchesRevision,
+  setCachedSessionResponse,
+} from "@/lib/session-response-cache";
 
 export async function GET(
   req: Request,
@@ -28,20 +34,41 @@ export async function GET(
       return NextResponse.json({ error: "Session not found" }, { status: 404 });
     }
 
+    const searchParams = new URL(req.url).searchParams;
+    const deferThinking = searchParams.has("deferThinking");
+    const deferToolResultImages = searchParams.has("deferMedia");
+    const responseScope = `full:${deferThinking ? 1 : 0}:${deferToolResultImages ? 1 : 0}`;
+    const persistedStat = !liveRpc && resolvedPath ? statSync(resolvedPath) : null;
+    const revision = persistedStat
+      ? createSessionRevision(persistedStat, responseScope)
+      : null;
+    const responseCacheKey = resolvedPath
+      ? `${sessionPathKey(resolvedPath)}:${responseScope}`
+      : null;
+    const revisionHeaders = revision
+      ? { ETag: revision, "Cache-Control": "private, no-cache" }
+      : undefined;
+
+    if (revision && requestMatchesRevision(req.headers.get("if-none-match"), revision)) {
+      return new NextResponse(null, { status: 304, headers: revisionHeaders });
+    }
+    if (revision && responseCacheKey) {
+      const cached = getCachedSessionResponse<object>(responseCacheKey, revision);
+      if (cached) return NextResponse.json(cached, { headers: revisionHeaders });
+    }
+
     const sm = liveRpc?.inner.sessionManager ?? SessionManager.open(resolvedPath!);
     const filePath = liveRpc?.sessionFile || sm.getSessionFile() || resolvedPath || "";
     const entries = sm.getEntries();
     const leafId = sm.getLeafId();
     const tree = projectTreeForResponse(sm.getTree());
-    const searchParams = new URL(req.url).searchParams;
-    const deferThinking = searchParams.has("deferThinking");
-    const deferToolResultImages = searchParams.has("deferMedia");
     const context = buildSessionContext(entries as never, leafId, { deferThinking, deferToolResultImages });
     const totalActiveMs = computeSessionTotalActiveMs(entries);
 
     const header = sm.getHeader();
     let modified = header?.timestamp ?? new Date().toISOString();
-    try { modified = statSync(filePath).mtime.toISOString(); } catch { /* use header timestamp */ }
+    if (persistedStat) modified = persistedStat.mtime.toISOString();
+    else try { modified = statSync(filePath).mtime.toISOString(); } catch { /* use header timestamp */ }
     const parentSessionId = header?.parentSession
       ? await resolveSessionIdByPath(header.parentSession)
       : undefined;
@@ -64,7 +91,7 @@ export async function GET(
       transient: !filePath || !existsSync(filePath),
     } : null;
 
-    return NextResponse.json({
+    const responseData = {
       sessionId: id,
       filePath,
       info,
@@ -72,7 +99,11 @@ export async function GET(
       tree,
       context,
       totalActiveMs,
-    });
+    };
+    if (revision && responseCacheKey) {
+      setCachedSessionResponse(responseCacheKey, revision, responseData);
+    }
+    return NextResponse.json(responseData, { headers: revisionHeaders });
   } catch (error) {
     return NextResponse.json({ error: String(error) }, { status: 500 });
   }

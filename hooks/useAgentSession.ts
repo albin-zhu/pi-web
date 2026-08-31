@@ -327,6 +327,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const eventStreamGraceGenerationRef = useRef(0);
   const eventStreamGraceActiveRef = useRef(false);
   const sessionIdRef = useRef<string | null>(session?.id ?? null);
+  const sessionRevisionRef = useRef<string | null>(initialSessionSnapshot?.revision ?? null);
   const messagesRef = useRef(messages);
   const activeLeafIdRef = useRef(activeLeafId);
   const sessionPropIdRef = useRef<string | null>(session?.id ?? null);
@@ -490,6 +491,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       entryIds,
       activeLeafId,
       cachedAt: Date.now(),
+      revision: sessionRevisionRef.current ?? undefined,
     });
   }, [activeLeafId, data, entryIds, messages, session]);
 
@@ -505,9 +507,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     try {
       if (showLoading) setLoading(true);
       const params = new URLSearchParams({ deferThinking: "1", deferMedia: "1" });
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}?${params}`);
+      const revision = sessionRevisionRef.current;
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}?${params}`, {
+        headers: revision ? { "If-None-Match": revision } : undefined,
+      });
       if (res.status === 404) {
         if (sessionIdRef.current === sid) {
+          sessionRevisionRef.current = null;
           deleteSessionViewSnapshot(sid);
           setData(null);
           setActiveLeafId(null);
@@ -517,25 +523,31 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         }
         return null;
       }
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const d = await res.json() as SessionData;
-      if (sessionIdRef.current !== sid) return null;
-      const cachedViewChanged = protectCachedView && (
-        messagesRef.current !== messagesAtStart
-        || activeLeafIdRef.current !== leafAtStart
-      );
-      if (!cachedViewChanged) {
-        const persistedMessages = d.context.messages;
-        setData(d);
-        setActiveLeafId(d.leafId);
-        setMessages(persistedMessages);
-        setEntryIds(d.context.entryIds ?? []);
-        setCurrentModelOverride((current) => modelSwitchPendingRef.current ? current : null);
-        setError(null);
-        if (d.context.thinkingLevel && d.context.thinkingLevel !== "off") {
-          setThinkingLevel(d.context.thinkingLevel as ThinkingLevelOption);
-        }
+      if (res.status === 304) {
         messagesLoaded = true;
+        setError(null);
+      } else {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const d = await res.json() as SessionData;
+        if (sessionIdRef.current !== sid) return null;
+        sessionRevisionRef.current = res.headers.get("etag");
+        const cachedViewChanged = protectCachedView && (
+          messagesRef.current !== messagesAtStart
+          || activeLeafIdRef.current !== leafAtStart
+        );
+        if (!cachedViewChanged) {
+          const persistedMessages = d.context.messages;
+          setData(d);
+          setActiveLeafId(d.leafId);
+          setMessages(persistedMessages);
+          setEntryIds(d.context.entryIds ?? []);
+          setCurrentModelOverride((current) => modelSwitchPendingRef.current ? current : null);
+          setError(null);
+          if (d.context.thinkingLevel && d.context.thinkingLevel !== "off") {
+            setThinkingLevel(d.context.thinkingLevel as ThinkingLevelOption);
+          }
+          messagesLoaded = true;
+        }
       }
       if (showLoading) setLoading(false);
       if (!includeState) return null;
