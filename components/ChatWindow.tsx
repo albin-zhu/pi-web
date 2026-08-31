@@ -21,9 +21,11 @@ import {
   getNextVisibleCount,
   getPromptAnchorSpacerHeight,
   getVisibleRenderWindow,
+  isScrollAtTail,
   restoreScrollTop,
   VISIBLE_PAGE_SIZE,
 } from "@/lib/chat-lazy-load";
+import { getSessionViewSnapshot, updateSessionViewUi } from "@/lib/session-view-cache";
 
 interface Props {
   session: SessionInfo | null;
@@ -253,6 +255,9 @@ function ProcessDetailsGroup({ messageCount, toolCallCount, defaultExpanded = fa
 export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionDraftKey, onAgentEnd, onAttentionNeeded, onSessionCreated, onSessionForked, modelsRefreshKey, chatInputRef, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsChange, onSessionStatsPanelOpen, onContextUsageChange, onOpenFile, soundEnabled = true, onSoundToggle, playDoneSound = () => {}, unlockAudio }: Props) {
   const { t } = useI18n();
   const isMobile = useIsMobile();
+  const [initialCachedUi] = useState(() => (
+    session ? getSessionViewSnapshot(session.id)?.ui : undefined
+  ));
 
   // Wrap onAgentEnd to play the completion sound. This is more reliable than
   // wrapping handleAgentEventRef because useAgentSession overwrites that ref
@@ -312,9 +317,37 @@ export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionD
   // --- Lazy-load historical messages ---
   // Only render the last N messages initially. When the user scrolls to the
   // top, load another page while keeping the scroll position stable.
-  const [visibleCount, setVisibleCount] = useState(VISIBLE_PAGE_SIZE);
+  const [visibleCount, setVisibleCount] = useState(initialCachedUi?.visibleCount ?? VISIBLE_PAGE_SIZE);
+  const visibleCountRef = useRef(visibleCount);
+  visibleCountRef.current = visibleCount;
   const sentinelRef = useRef<HTMLDivElement>(null);
   const prevScrollDistanceRef = useRef<number | null>(null);
+
+  // A cache hit renders synchronously. Restore a non-tail viewport after the
+  // cached render window has been laid out; tail views keep the normal bottom
+  // anchoring behavior from useAgentSession.
+  useLayoutEffect(() => {
+    if (!initialCachedUi || initialCachedUi.atTail) return;
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    container.scrollTop = Math.min(
+      initialCachedUi.scrollTop,
+      Math.max(0, container.scrollHeight - container.clientHeight),
+    );
+  }, [initialCachedUi, scrollContainerRef]);
+
+  // Persist lightweight UI state before React detaches the scroll-container
+  // ref while replacing this keyed ChatWindow.
+  useLayoutEffect(() => () => {
+    if (!session) return;
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    updateSessionViewUi(session.id, {
+      scrollTop: container.scrollTop,
+      visibleCount: visibleCountRef.current,
+      atTail: isScrollAtTail(container.scrollTop, container.clientHeight, container.scrollHeight),
+    });
+  }, [scrollContainerRef, session]);
 
   // IntersectionObserver on the sentinel div at the top of the message list.
   // When it becomes visible, load the next page of older messages.

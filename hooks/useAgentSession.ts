@@ -31,6 +31,11 @@ import {
   streamReducer,
   type ClientAssistantMessageEvent,
 } from "@/lib/streaming-message";
+import {
+  deleteSessionViewSnapshot,
+  getSessionViewSnapshot,
+  setSessionViewSnapshot,
+} from "@/lib/session-view-cache";
 
 export interface SessionData {
   sessionId: string;
@@ -268,13 +273,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   } = opts;
 
   const isNew = session === null && newSessionCwd !== null;
+  const [initialSessionSnapshot] = useState(() => (
+    session ? getSessionViewSnapshot<SessionData>(session.id) : undefined
+  ));
 
-  const [data, setData] = useState<SessionData | null>(null);
-  const [loading, setLoading] = useState(!isNew);
+  const [data, setData] = useState<SessionData | null>(initialSessionSnapshot?.data ?? null);
+  const [loading, setLoading] = useState(!isNew && !initialSessionSnapshot);
   const [error, setError] = useState<string | null>(null);
-  const [activeLeafId, setActiveLeafId] = useState<string | null>(null);
-  const [messages, setMessages] = useState<AgentMessage[]>([]);
-  const [entryIds, setEntryIds] = useState<string[]>([]);
+  const [activeLeafId, setActiveLeafId] = useState<string | null>(initialSessionSnapshot?.activeLeafId ?? null);
+  const [messages, setMessages] = useState<AgentMessage[]>(initialSessionSnapshot?.messages ?? []);
+  const [entryIds, setEntryIds] = useState<string[]>(initialSessionSnapshot?.entryIds ?? []);
   const [streamState, dispatch] = useReducer(streamReducer, INITIAL_STREAMING_STATE);
   const [agentRunning, setAgentRunning] = useState(false);
   const [bashRunning, setBashRunning] = useState(false);
@@ -288,7 +296,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [newSessionModel, setNewSessionModel] = useState<SelectedModel | null>(null);
   const [newSessionDefaultModel, setNewSessionDefaultModel] = useState<SelectedModel | null>(null);
   const [toolPreset, setToolPreset] = useState<ToolPreset>("default");
-  const [thinkingLevel, setThinkingLevel] = useState<ThinkingLevelOption>("auto");
+  const [thinkingLevel, setThinkingLevel] = useState<ThinkingLevelOption>(() => {
+    const cached = initialSessionSnapshot?.data.context.thinkingLevel;
+    return cached && cached !== "off" ? cached as ThinkingLevelOption : "auto";
+  });
   const [retryInfo, setRetryInfo] = useState<{ attempt: number; maxAttempts: number; errorMessage?: string } | null>(null);
   const [contextUsage, setContextUsage] = useState<{ percent: number | null; contextWindow: number; tokens: number | null } | null>(null);
   const [systemPrompt, setSystemPrompt] = useState<string | null>(null);
@@ -316,6 +327,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const eventStreamGraceGenerationRef = useRef(0);
   const eventStreamGraceActiveRef = useRef(false);
   const sessionIdRef = useRef<string | null>(session?.id ?? null);
+  const messagesRef = useRef(messages);
+  const activeLeafIdRef = useRef(activeLeafId);
   const sessionPropIdRef = useRef<string | null>(session?.id ?? null);
   const sessionRunningRef = useRef(Boolean(sessionRunning));
   const agentRunningRef = useRef(false);
@@ -325,11 +338,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const bashRunningRef = useRef(false);
   const bashRecoveryIdRef = useRef(0);
   const handleAgentEventRef = useRef<((event: AgentEvent) => void) | null>(null);
-  const initialScrollDoneRef = useRef(false);
+  const initialScrollDoneRef = useRef(Boolean(initialSessionSnapshot?.ui && !initialSessionSnapshot.ui.atTail));
   const lastUserMsgRef = useRef<HTMLDivElement | null>(null);
   const pendingScrollToUserRef = useRef(false);
-  const isNearBottomRef = useRef(true);
-  const previousScrollTopRef = useRef(0);
+  const isNearBottomRef = useRef(initialSessionSnapshot?.ui?.atTail ?? true);
+  const previousScrollTopRef = useRef(initialSessionSnapshot?.ui?.scrollTop ?? 0);
   const liveFollowFrameRef = useRef<number | null>(null);
   const executeBashRef = useRef<(command: string, excludeFromContext: boolean) => Promise<void> | undefined>(undefined);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
@@ -344,6 +357,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const draftKeyAliasesRef = useRef(new Map<string, string>());
   const sessionHookMountedRef = useRef(true);
 
+  messagesRef.current = messages;
+  activeLeafIdRef.current = activeLeafId;
   sessionPropIdRef.current = session?.id ?? null;
   sessionRunningRef.current = Boolean(sessionRunning);
 
@@ -460,17 +475,44 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } satisfies SessionStatsInfo;
   }, [messages, sessionStatsOverride, contextUsage, data?.filePath, data?.totalActiveMs, session?.id, session?.name]);
 
-  const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false) => {
+  // Keep a bounded stale-while-revalidate snapshot. ChatWindow captures the
+  // scroll/render window separately so revisiting a session can paint in the
+  // first render instead of waiting for disk and JSON parsing again.
+  useEffect(() => {
+    if (!session || !data || data.sessionId !== session.id) return;
+    setSessionViewSnapshot(session.id, {
+      data: {
+        ...data,
+        leafId: activeLeafId,
+        context: { ...data.context, messages, entryIds },
+      },
+      messages,
+      entryIds,
+      activeLeafId,
+      cachedAt: Date.now(),
+    });
+  }, [activeLeafId, data, entryIds, messages, session]);
+
+  const loadSession = useCallback(async (
+    sid: string,
+    showLoading = false,
+    includeState = false,
+    protectCachedView = false,
+  ) => {
     let messagesLoaded = false;
+    const messagesAtStart = messagesRef.current;
+    const leafAtStart = activeLeafIdRef.current;
     try {
       if (showLoading) setLoading(true);
       const params = new URLSearchParams({ deferThinking: "1", deferMedia: "1" });
       const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}?${params}`);
       if (res.status === 404) {
-        if (showLoading) {
+        if (sessionIdRef.current === sid) {
+          deleteSessionViewSnapshot(sid);
           setData(null);
           setActiveLeafId(null);
           setMessages([]);
+          setEntryIds([]);
           setError(null);
         }
         return null;
@@ -478,18 +520,23 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const d = await res.json() as SessionData;
       if (sessionIdRef.current !== sid) return null;
-      const persistedMessages = d.context.messages;
-      setData(d);
-      setActiveLeafId(d.leafId);
-      setMessages(persistedMessages);
-      setEntryIds(d.context.entryIds ?? []);
-      setCurrentModelOverride((current) => modelSwitchPendingRef.current ? current : null);
-      setError(null);
-      if (d.context.thinkingLevel && d.context.thinkingLevel !== "off") {
-        setThinkingLevel(d.context.thinkingLevel as ThinkingLevelOption);
+      const cachedViewChanged = protectCachedView && (
+        messagesRef.current !== messagesAtStart
+        || activeLeafIdRef.current !== leafAtStart
+      );
+      if (!cachedViewChanged) {
+        const persistedMessages = d.context.messages;
+        setData(d);
+        setActiveLeafId(d.leafId);
+        setMessages(persistedMessages);
+        setEntryIds(d.context.entryIds ?? []);
+        setCurrentModelOverride((current) => modelSwitchPendingRef.current ? current : null);
+        setError(null);
+        if (d.context.thinkingLevel && d.context.thinkingLevel !== "off") {
+          setThinkingLevel(d.context.thinkingLevel as ThinkingLevelOption);
+        }
+        messagesLoaded = true;
       }
-
-      messagesLoaded = true;
       if (showLoading) setLoading(false);
       if (!includeState) return null;
 
@@ -516,7 +563,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         return null;
       }
     } catch (e) {
-      setError(String(e));
+      // A cached view remains useful during a transient revalidation failure.
+      // Only replace the chat with an error when there is no stale snapshot.
+      if (!getSessionViewSnapshot(sid)) setError(String(e));
       return null;
     } finally {
       if (showLoading && !messagesLoaded) setLoading(false);
@@ -1787,7 +1836,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     sessionHookMountedRef.current = true;
     if (session) {
       sessionIdRef.current = session.id;
-      loadSession(session.id, true, true).then((agentState) => {
+      loadSession(session.id, !initialSessionSnapshot, true, Boolean(initialSessionSnapshot)).then((agentState) => {
         if (agentState?.running) {
           loadTools(session.id);
           if (agentState.state?.isStreaming || agentState.state?.isPromptRunning) {

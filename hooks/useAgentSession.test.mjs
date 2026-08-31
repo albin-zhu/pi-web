@@ -7,6 +7,31 @@ const chatWindowSource = await readFile(new URL("../components/ChatWindow.tsx", 
 const chatInputSource = await readFile(new URL("../components/ChatInput.tsx", import.meta.url), "utf8");
 const appShellSource = await readFile(new URL("../components/AppShell.tsx", import.meta.url), "utf8");
 
+test("revisiting a session paints its cached view while revalidating in the background", () => {
+  const mountSource = source.slice(
+    source.indexOf("  // Load session on mount"),
+    source.indexOf("  useEffect(() => {\n    onSystemPromptChange"),
+  );
+  const loadSource = source.slice(
+    source.indexOf("  const loadSession = useCallback"),
+    source.indexOf("  const loadContext = useCallback"),
+  );
+
+  assert.match(source, /getSessionViewSnapshot<SessionData>\(session\.id\)/);
+  assert.match(source, /useState\(!isNew && !initialSessionSnapshot\)/);
+  assert.match(mountSource, /loadSession\(session\.id, !initialSessionSnapshot, true, Boolean\(initialSessionSnapshot\)\)/);
+  assert.match(loadSource, /cachedViewChanged = protectCachedView/);
+  assert.match(loadSource, /messagesRef\.current !== messagesAtStart/);
+  assert.match(loadSource, /activeLeafIdRef\.current !== leafAtStart/);
+});
+
+test("captures and restores the cached session render window", () => {
+  assert.match(chatWindowSource, /initialCachedUi\?\.visibleCount \?\? VISIBLE_PAGE_SIZE/);
+  assert.match(chatWindowSource, /container\.scrollTop = Math\.min\(/);
+  assert.match(chatWindowSource, /updateSessionViewUi\(session\.id/);
+  assert.match(chatWindowSource, /atTail: isScrollAtTail/);
+});
+
 test("keeps the session event stream open through the idle grace window", () => {
   const finishSource = source.slice(
     source.indexOf("const finishPromptWithoutStream"),
@@ -353,7 +378,7 @@ test("keeps live following cancellable when the user scrolls away from the tail"
   );
 
   assert.match(source, /const liveFollowFrameRef = useRef<number \| null>\(null\)/);
-  assert.match(source, /const previousScrollTopRef = useRef\(0\)/);
+  assert.match(source, /const previousScrollTopRef = useRef\(initialSessionSnapshot\?\.ui\?\.scrollTop \?\? 0\)/);
   assert.match(source, /const wasAttached = isNearBottomRef\.current;[\s\S]*?const isAttached = getLiveFollowAttached\([\s\S]*?wasAttached,[\s\S]*?previousScrollTopRef\.current,[\s\S]*?scrollTop,[\s\S]*?clientHeight,[\s\S]*?scrollHeight/);
   assert.match(scrollHandlerSource, /const isAgentRunning = agentRunningRef\.current;[\s\S]*?isAgentRunning\s*\? CHAT_SCROLL_REATTACH_TOLERANCE\s*:\s*CHAT_SCROLL_TAIL_TOLERANCE/);
   assert.match(source, /previousScrollTopRef\.current = scrollTop/);
