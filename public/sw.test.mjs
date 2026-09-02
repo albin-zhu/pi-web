@@ -26,6 +26,23 @@ function dispatchNotificationClick(data) {
   return { pending, wasClosed: () => closed };
 }
 
+function dispatchFetch(pathname) {
+  let response;
+  listeners.get("fetch")({
+    request: {
+      method: "GET",
+      mode: "cors",
+      url: `https://pi.test${pathname}`,
+    },
+    respondWith: (value) => { response = value; },
+  });
+  return response;
+}
+
+test("does not intercept Next.js chunks with the PWA cache", () => {
+  assert.equal(dispatchFetch("/_next/static/chunks/app.js"), undefined);
+});
+
 test("notification click focuses an existing client at the session URL", async () => {
   const calls = [];
   const focusedClient = {

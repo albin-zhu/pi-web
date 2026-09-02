@@ -1,6 +1,7 @@
 const CACHE_PREFIX = "pi-web";
+const CACHE_SCHEMA = "v2";
 const CACHE_VERSION = new URL(self.location.href).searchParams.get("v") || "dev";
-const STATIC_CACHE = `${CACHE_PREFIX}-static-${CACHE_VERSION}`;
+const STATIC_CACHE = `${CACHE_PREFIX}-static-${CACHE_SCHEMA}-${CACHE_VERSION}`;
 const OFFLINE_URL = "/offline.html";
 const PRECACHE_URLS = [
   OFFLINE_URL,
@@ -54,11 +55,11 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  const isStaticAsset =
-    url.pathname.startsWith("/_next/static/") ||
-    PRECACHE_URLS.includes(url.pathname);
-
-  if (isStaticAsset) {
+  // Never cache Next.js chunks in the service worker. Production chunk URLs
+  // are content-addressed and the browser already caches them efficiently;
+  // development chunk names can be reused across restarts. Serving either from
+  // an old PWA cache can mix server and client releases and break hydration.
+  if (PRECACHE_URLS.includes(url.pathname)) {
     event.respondWith(cacheFirst(request));
   }
 });
