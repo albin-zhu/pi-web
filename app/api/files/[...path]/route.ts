@@ -5,9 +5,12 @@ import {
   getAllowedFileRoots,
   isExistingFilePathAllowed,
   isFilePathAllowed,
-  isWindowsAbsolutePath,
-  normalizeSlashes,
 } from "@/lib/file-access";
+import {
+  decodeFilePathFromApiSegments,
+  isNetworkOrDeviceFilePath,
+  isWindowsDeviceFilePath,
+} from "@/lib/file-paths";
 import {
   DOCX_PREVIEW_MAX_BYTES,
   IMAGE_PREVIEW_MAX_BYTES,
@@ -72,10 +75,7 @@ function getLanguage(filePath: string): string {
 }
 
 function filePathFromSegments(segments: string[]): string {
-  const joined = segments.join("/");
-  const slashJoined = normalizeSlashes(joined);
-  if (isWindowsAbsolutePath(slashJoined)) return slashJoined;
-  return "/" + joined.replace(/^\/+/, "");
+  return decodeFilePathFromApiSegments(segments);
 }
 
 function parseFileRequestType(value: string): FileRequestType | null {
@@ -86,6 +86,9 @@ async function getUploadDirectory(segments: string[]): Promise<
   { directory: string } | { response: NextResponse }
 > {
   const directory = filePathFromSegments(segments);
+  if (isWindowsDeviceFilePath(directory, process.platform === "win32")) {
+    return { response: NextResponse.json({ error: "Access denied" }, { status: 403 }) };
+  }
   const allowedRoots = await getAllowedFileRoots();
   if (!isFilePathAllowed(directory, allowedRoots)) {
     return { response: NextResponse.json({ error: "Access denied" }, { status: 403 }) };
@@ -420,6 +423,9 @@ export async function GET(
   try {
     const { path: segments } = await params;
     const filePath = filePathFromSegments(segments);
+    if (isWindowsDeviceFilePath(filePath, process.platform === "win32")) {
+      return NextResponse.json({ error: "Access denied" }, { status: 403 });
+    }
     const rawType = request.nextUrl.searchParams.get("type") ?? "list";
     const type = parseFileRequestType(rawType);
     if (!type) {
@@ -431,6 +437,7 @@ export async function GET(
     const allowedByRoot = isFilePathAllowed(filePath, allowedRoots);
     const allowedBySessionReference =
       !allowedByRoot &&
+      !isNetworkOrDeviceFilePath(filePath) &&
       type !== "list" &&
       await isFilePathReferencedBySession(filePath, sessionId);
     if (!allowedByRoot && !allowedBySessionReference) {
@@ -461,7 +468,7 @@ export async function GET(
       const imageMime = getImageMime(filePath);
       if (imageMime) {
         if (stat.size > IMAGE_PREVIEW_MAX_BYTES) {
-          return NextResponse.json({ error: "Image too large (>10MB)" }, { status: 413 });
+          return NextResponse.json({ error: "Image too large (>100MB)" }, { status: 413 });
         }
         return streamFile(filePath, stat, imageMime, request.headers.get("range"));
       }

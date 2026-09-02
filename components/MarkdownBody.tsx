@@ -3,7 +3,12 @@
 import { useMemo, type MouseEvent } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import { resolveLocalFileHref } from "@/lib/file-links";
-import { getFileApiUrl, getFileName } from "@/lib/file-paths";
+import {
+  getFileApiUrl,
+  getFileName,
+  isNetworkOrDeviceFilePath,
+  isWindowsDeviceFilePath,
+} from "@/lib/file-paths";
 import { isVideoPath } from "@/lib/file-types";
 import { markdownRehypePlugins, markdownRemarkPlugins, normalizeDisplayMath } from "@/lib/markdown";
 import { MermaidBlock, CodeBlock } from "./MermaidBlock";
@@ -46,7 +51,12 @@ export function MarkdownBody({ children, className, isStreaming, cwd, sessionId,
     a({ href, children, ...props }) {
       // `node` is react-markdown metadata, not a DOM attribute.
       delete props.node;
-      const filePath = onOpenFile ? resolveLocalFileHref(href, cwd) : null;
+      const resolvedPath = onOpenFile ? resolveLocalFileHref(href, cwd) : null;
+      const filePath = resolvedPath
+        && !isNetworkOrDeviceFilePath(resolvedPath)
+        && !isWindowsDeviceFilePath(resolvedPath, true)
+        ? resolvedPath
+        : null;
       const openFile = onOpenFile;
       if (!filePath || !openFile) {
         return (
@@ -73,7 +83,14 @@ export function MarkdownBody({ children, className, isStreaming, cwd, sessionId,
     },
     img({ src, alt, ...props }) {
       delete props.node;
-      const filePath = typeof src === "string" ? resolveLocalFileHref(src, cwd) : null;
+      const resolvedPath = typeof src === "string" ? resolveLocalFileHref(src, cwd) : null;
+      if (
+        resolvedPath
+        && (isNetworkOrDeviceFilePath(resolvedPath) || isWindowsDeviceFilePath(resolvedPath, true))
+      ) {
+        return <span>{alt || getFileName(resolvedPath)}</span>;
+      }
+      const filePath = resolvedPath;
       const mediaSrc = filePath
         ? getFileApiUrl(filePath, "read", sessionId)
         : src;

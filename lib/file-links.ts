@@ -7,10 +7,9 @@ function safeDecode(value: string): string {
 }
 
 function normalizeFilePathSlashes(filePath: string): string {
-  if (/^[a-zA-Z]:[\\/]/.test(filePath) || filePath.startsWith("\\\\")) {
-    return filePath.replace(/\\/g, "/");
-  }
-  return filePath;
+  // Backslashes in href-like values represent Windows path separators even
+  // when the path is relative (for example `out\\video\\clip.mp4`).
+  return filePath.replace(/\\/g, "/");
 }
 
 function stripLineSuffix(filePath: string): string {

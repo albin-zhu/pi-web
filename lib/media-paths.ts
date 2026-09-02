@@ -1,5 +1,9 @@
 import { resolveLocalFileHref } from "./file-links";
-import { normalizeFilePathSlashes } from "./file-paths";
+import {
+  isNetworkOrDeviceFilePath,
+  isWindowsDeviceFilePath,
+  normalizeFilePathSlashes,
+} from "./file-paths";
 import { IMAGE_EXT_TO_MIME, VIDEO_EXT_TO_MIME, isImagePath, isVideoPath } from "./file-types";
 
 export const MAX_MESSAGE_MEDIA_PREVIEWS = 6;
@@ -14,10 +18,12 @@ export interface MessageMediaPath {
 
 const MEDIA_EXT = [...Object.keys(IMAGE_EXT_TO_MIME), ...Object.keys(VIDEO_EXT_TO_MIME)].join("|");
 const MEDIA_PATH_RE = new RegExp(
-  String.raw`(?:file://[^\s"'<>)]+|` +
+  String.raw`(?:(?:\\\\|//)[?.](?:\\|/)[^\s"'<>|*)]+|` +
+  String.raw`file://[^\s"'<>)]+|` +
   String.raw`[A-Za-z]:[\\/][^\s"'<>|*?)]+|` +
   String.raw`\\\\[^\s"'<>|*?)]+|` +
-  String.raw`(?:\.\.?/)[^\s"'<>|*?)]+|` +
+  String.raw`(?:\.\.?[\\/])[^\s"'<>|*?)]+|` +
+  String.raw`(?:[A-Za-z0-9_.@+~-]+[\\/])+[^\s"'<>|*?)]+|` +
   String.raw`/[^\s"'<>|*?)]+)` +
   String.raw`\.(?:${MEDIA_EXT})\b`,
   "gi",
@@ -53,8 +59,12 @@ export function extractLocalMediaPaths(text: string, cwd?: string): MessageMedia
   const paths: MessageMediaPath[] = [];
 
   for (const match of text.matchAll(MEDIA_PATH_RE)) {
+    const prefix = text.slice(Math.max(0, (match.index ?? 0) - 32), match.index ?? 0);
+    if (/^[A-Za-z]:[\\/]{2}/u.test(match[0])) continue;
+    if (/[A-Za-z][A-Za-z0-9+.-]*:[\\/]{1,2}$/u.test(prefix)) continue;
     const resolved = resolveLocalFileHref(match[0], cwd);
     if (!resolved) continue;
+    if (isNetworkOrDeviceFilePath(resolved) || isWindowsDeviceFilePath(resolved, true)) continue;
     const kind = mediaKind(resolved);
     if (!kind) continue;
     const key = pathKey(resolved);

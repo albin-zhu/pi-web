@@ -1,5 +1,6 @@
 import fs from "fs";
 import path from "path";
+import { isUnsafeWindowsPathSegment } from "./file-paths";
 
 export const UPLOAD_CONFLICT_STRATEGIES = ["error", "overwrite", "skip"] as const;
 export type UploadConflictStrategy = typeof UPLOAD_CONFLICT_STRATEGIES[number];
@@ -29,6 +30,9 @@ export function validateUploadFileNames(fileNames: string[]): string | null {
     if (fileName.includes("/") || fileName.includes("\\") || path.basename(fileName) !== fileName) {
       return `File names must not contain a path: ${fileName}`;
     }
+    if (isUnsafeWindowsPathSegment(fileName)) {
+      return `File name is unsafe on Windows: ${fileName}`;
+    }
     if (seen.has(fileName)) return `Duplicate file name in upload: ${fileName}`;
     seen.add(fileName);
   }
@@ -37,6 +41,9 @@ export function validateUploadFileNames(fileNames: string[]): string | null {
 }
 
 export function inspectUploadTargets(directory: string, fileNames: string[]): UploadTargetInspection {
+  const validationError = validateUploadFileNames(fileNames);
+  if (validationError) throw new Error(validationError);
+
   const conflicts: string[] = [];
   const nonReplaceable: string[] = [];
 

@@ -104,6 +104,12 @@ test("renders local video markdown images as a video player", () => {
   assert.doesNotMatch(html, /<img /);
 });
 
+test("does not auto-preview Windows reserved device paths", () => {
+  const reservedHtml = renderMarkdown("![clip](file:///C:/renders/NUL.mp4)");
+
+  assert.doesNotMatch(reservedHtml, /<video |\ssrc=|\/api\/files\//);
+});
+
 test("does not normalize escaped delimiters or link destinations", () => {
   const escaped = String.raw`Literal: \\(x+y\\).`;
   const link = String.raw`[docs](https://example.com/\(manual\))`;
