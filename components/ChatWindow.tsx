@@ -17,6 +17,10 @@ import { useIsMobile } from "@/hooks/useIsMobile";
 import type { SessionStatsInfo } from "@/lib/pi-types";
 import type { AppUpdateResponse } from "@/lib/api-types";
 import {
+  isArtifactBundleMessage,
+  isRerunnableArtifactRunId,
+} from "@/lib/artifact-bundle";
+import {
   captureScrollDistance,
   getNextVisibleCount,
   getPromptAnchorSpacerHeight,
@@ -276,7 +280,7 @@ export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionD
   }, [chatInputRef]);
 
   const {
-    loading, error, messages, entryIds, streamState,
+    data, loading, error, activeLeafId, messages, entryIds, streamState,
     agentRunning, bashRunning, pendingBash, modelNames, modelList, modelError, modelScopeWarnings, modelThinkingLevels, modelThinkingLevelMaps, toolPreset, thinkingLevel,
     retryInfo, contextUsage, forkingEntryId,
     isCompacting, compactError, compactResult, displayModel: displayModelValue, modelSwitching, sessionStats,
@@ -297,6 +301,31 @@ export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionD
     modelsRefreshKey, chatInputRef, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsPanelOpen,
   });
   const sessionBusy = agentRunning || bashRunning;
+  const artifactActionTargetRef = useRef<{ sessionId: string | null; leafId: string | null }>({
+    sessionId: null,
+    leafId: null,
+  });
+  artifactActionTargetRef.current = {
+    sessionId: session?.id ?? sessionIdRef.current,
+    leafId: activeLeafId,
+  };
+  const artifactSourceSessionId = data?.sessionId;
+  const artifactSourceLeafId = data?.leafId ?? null;
+  const artifactActionReady = Boolean(
+    artifactSourceSessionId
+    && artifactSourceSessionId === artifactActionTargetRef.current.sessionId
+    && artifactSourceLeafId === artifactActionTargetRef.current.leafId,
+  );
+  const handleArtifactRerun = useCallback((
+    runId: string,
+    sourceSessionId: string,
+    sourceLeafId: string | null,
+  ): boolean => {
+    const target = artifactActionTargetRef.current;
+    if (sourceSessionId !== target.sessionId || sourceLeafId !== target.leafId) return false;
+    if (sessionBusy || isNew || !isRerunnableArtifactRunId(runId)) return false;
+    return chatInputRef?.current?.insertIfEmpty(t("artifact.rerunPrompt", { runId })) ?? false;
+  }, [chatInputRef, isNew, sessionBusy, t]);
 
   useEffect(() => {
     if (!extensionDialog || soundedExtensionDialogIdRef.current === extensionDialog.id) return;
@@ -760,6 +789,10 @@ export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionD
                     modelNames={modelNames}
                     cwd={messageCwd}
                     onOpenFile={onOpenFile}
+                    onRerunArtifact={handleArtifactRerun}
+                    artifactRerunDisabled={sessionBusy || isNew || !artifactActionReady}
+                    artifactSourceSessionId={artifactSourceSessionId}
+                    artifactSourceLeafId={artifactSourceLeafId}
                     entryId={entryIds[idx]}
                     onFork={sessionBusy || isNew || (idx === 0 && msg.role === "user") ? undefined : handleFork}
                     forking={forkingEntryId === entryIds[idx]}
@@ -818,7 +851,11 @@ export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionD
                 for (let processIdx = userIdx + 1; processIdx < finalAssistantIdx; processIdx++) {
                   processIndices.push(processIdx);
                 }
-                const visibleProcessIndices = processIndices.filter((processIdx) => hasDisplayableProcessMessage(messages[processIdx]));
+                const artifactProcessIndices = processIndices.filter((processIdx) => isArtifactBundleMessage(messages[processIdx]));
+                const visibleProcessIndices = processIndices.filter((processIdx) => (
+                  !isArtifactBundleMessage(messages[processIdx])
+                  && hasDisplayableProcessMessage(messages[processIdx])
+                ));
                 const finalAssistant = messages[finalAssistantIdx] as AssistantMessage;
                 const finalSplit = splitFinalAssistantBlocks(finalAssistant);
                 const finalProcessMessage = finalSplit.processBlocks.length > 0
@@ -869,6 +906,9 @@ export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionD
                   }
                   const writtenFiles = extractTurnWrittenFiles(turnContent, toolResultsMap, messageCwd);
                   rendered.push(renderMessage(finalAssistantIdx, { messageOverride: finalAnswerMessage, writtenFiles }));
+                }
+                for (const artifactIdx of artifactProcessIndices) {
+                  rendered.push(renderMessage(artifactIdx));
                 }
                 for (let renderIdx = finalAssistantIdx + 1; renderIdx < endIdx; renderIdx++) {
                   rendered.push(renderMessage(renderIdx));

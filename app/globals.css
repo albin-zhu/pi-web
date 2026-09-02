@@ -240,6 +240,23 @@ body {
   to { opacity: 0.06; }
 }
 
+@keyframes artifact-progress-indeterminate {
+  0% { transform: translateX(-110%); }
+  50% { transform: translateX(90%); }
+  100% { transform: translateX(280%); }
+}
+
+.artifact-progress-indeterminate {
+  animation: artifact-progress-indeterminate 1.25s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .artifact-progress-indeterminate {
+    animation: none;
+    transform: translateX(90%);
+  }
+}
+
 button.extension-widget-trigger {
   cursor: pointer;
   transition: background 0.12s, color 0.12s;

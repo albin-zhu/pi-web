@@ -3,6 +3,7 @@ import test from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createJiti } from "jiti";
+import { readFile } from "node:fs/promises";
 
 const jiti = createJiti(import.meta.url, {
   jsx: { runtime: "automatic" },
@@ -11,6 +12,16 @@ const jiti = createJiti(import.meta.url, {
 const { ChatInput, ModelErrorBanner, ModelScopeWarningBanner, canRestoreUserMessage, filterModelOptions, getUpwardMenuMaxHeight, getUserMessageText, getUserMessageDraftImages } = await jiti.import("./ChatInput.tsx");
 const { clearDraft, getDraft, mergeRestoredSubmissionDraft, mergeRestoredSubmissionText, rekeyDraft, setDraft } = await jiti.import("../lib/draft-store.ts");
 const { I18nProvider } = await jiti.import("../hooks/useI18n.tsx");
+const chatInputSource = await readFile(new URL("./ChatInput.tsx", import.meta.url), "utf8");
+
+test("serializes empty-composer insert actions through the synchronous value ref", () => {
+  const start = chatInputSource.indexOf("    insertIfEmpty(text: string)");
+  const end = chatInputSource.indexOf("    replaceMessage(message: UserMessage)", start);
+  const method = chatInputSource.slice(start, end);
+  assert.match(method, /if \(valueRef\.current\.trim\(\)/);
+  assert.match(method, /valueRef\.current = text[\s\S]*?setValue\(text\)/);
+  assert.doesNotMatch(method, /const current = ta \? ta\.value/);
+});
 
 test("renders the upstream model error", () => {
   const html = renderToStaticMarkup(

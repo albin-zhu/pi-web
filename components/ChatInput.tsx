@@ -84,7 +84,7 @@ interface Props {
 
 export interface ChatInputHandle {
   insertText: (text: string) => void;
-  insertIfEmpty: (text: string) => void;
+  insertIfEmpty: (text: string) => boolean;
   replaceMessage: (message: UserMessage) => void;
   prependText: (text: string) => void;
   addImages: (files: File[]) => void;
@@ -454,8 +454,10 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   useImperativeHandle(ref, () => ({
     insertIfEmpty(text: string) {
       const ta = textareaRef.current;
-      const current = ta ? ta.value : value;
-      if (current.trim()) return;
+      // `valueRef` is updated synchronously below, while the textarea value is
+      // only committed on the next React render. Using one source for the
+      // guard and write makes two actions in the same tick atomic.
+      if (valueRef.current.trim() || attachedImagesRef.current.length > 0 || pendingImageCountRef.current > 0) return false;
       valueRef.current = text;
       setValue(text);
       setAtQuery(null);
@@ -465,6 +467,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
         ta.style.height = "auto";
         ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
       });
+      return true;
     },
     replaceMessage(message: UserMessage) {
       const ta = textareaRef.current;

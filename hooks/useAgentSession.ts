@@ -7,6 +7,7 @@ import type {
   ExtensionStatusItem,
   ExtensionUiRequest,
   ExtensionWidgetItem,
+  SessionEntry,
   SessionInfo,
   SessionTreeNode,
   UserMessage,
@@ -21,6 +22,11 @@ import type { SessionStatsInfo } from "@/lib/pi-types";
 import { userMessageKey } from "@/lib/prompt-recovery";
 import { AgentEventConnection } from "@/lib/agent-event-connection";
 import { getToolExecutionProgress } from "@/lib/tool-execution-progress";
+import {
+  artifactProgressEntryToMessage,
+  isArtifactBundleMessage,
+  upsertArtifactBundleMessage,
+} from "@/lib/artifact-bundle";
 import {
   CHAT_SCROLL_REATTACH_TOLERANCE,
   CHAT_SCROLL_TAIL_TOLERANCE,
@@ -230,7 +236,7 @@ function readCompactResult(result: unknown, reason: string): CompactResultInfo |
 
 export interface ChatInputHandle {
   insertText: (text: string) => void;
-  insertIfEmpty: (content: string) => void;
+  insertIfEmpty: (content: string) => boolean;
   replaceMessage: (message: UserMessage) => void;
   prependText: (text: string) => void;
   addImages: (files: File[]) => void;
@@ -322,6 +328,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const sdkAgentActiveRef = useRef(false);
   const rpcPromptPendingRef = useRef(false);
   const notifiedPromptRunIdRef = useRef(-1);
+  const agentStageGenerationRef = useRef(0);
   const bashRunningRef = useRef(false);
   const bashRecoveryIdRef = useRef(0);
   const handleAgentEventRef = useRef<((event: AgentEvent) => void) | null>(null);
@@ -339,6 +346,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const newSessionModelOverrideRef = useRef<SelectedModel | null>(null);
   const thinkingLevelOverrideRef = useRef<Exclude<ThinkingLevelOption, "auto"> | null>(null);
   const promptRunIdRef = useRef(0);
+  const sessionContextLoadGenerationRef = useRef(0);
+  const sessionLoadingGenerationRef = useRef(0);
+  const sessionStateLoadGenerationRef = useRef(0);
+  const toolsLoadGenerationRef = useRef(0);
+  const compactOperationGenerationRef = useRef(0);
+  const compactionUiGenerationRef = useRef(0);
   const optimisticUserMessageKeyRef = useRef<string | null>(null);
   const modelSwitchPendingRef = useRef(false);
   const draftKeyAliasesRef = useRef(new Map<string, string>());
@@ -369,6 +382,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }
 
   const setToolPresetState = opts.setToolPreset ?? setToolPreset;
+
+  const invalidatePendingContextLoads = useCallback(() => {
+    sessionContextLoadGenerationRef.current += 1;
+    sessionLoadingGenerationRef.current += 1;
+    if (sessionHookMountedRef.current) setLoading(false);
+  }, []);
 
   useLayoutEffect(() => {
     if (!isNew || sessionIdRef.current) return;
@@ -460,14 +479,41 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } satisfies SessionStatsInfo;
   }, [messages, sessionStatsOverride, contextUsage, data?.filePath, data?.totalActiveMs, session?.id, session?.name]);
 
-  const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false) => {
+  const loadSession = useCallback(async (
+    sid: string,
+    showLoading = false,
+    includeState = false,
+    shouldApply?: () => boolean,
+  ) => {
     let messagesLoaded = false;
+    const contextGeneration = ++sessionContextLoadGenerationRef.current;
+    const loadingGeneration = showLoading ? ++sessionLoadingGenerationRef.current : null;
+    const stateGeneration = includeState ? ++sessionStateLoadGenerationRef.current : null;
+    const canApplyRequest = () => (
+      sessionHookMountedRef.current
+      && sessionIdRef.current === sid
+      && (shouldApply?.() ?? true)
+    );
+    const canApplyContext = () => (
+      canApplyRequest() && sessionContextLoadGenerationRef.current === contextGeneration
+    );
+    const canApplyState = () => (
+      canApplyRequest()
+      && stateGeneration !== null
+      && sessionStateLoadGenerationRef.current === stateGeneration
+    );
+    const canSettleLoading = () => (
+      loadingGeneration !== null
+      && sessionHookMountedRef.current
+      && sessionIdRef.current === sid
+      && sessionLoadingGenerationRef.current === loadingGeneration
+    );
     try {
       if (showLoading) setLoading(true);
       const params = new URLSearchParams({ deferThinking: "1", deferMedia: "1" });
       const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}?${params}`);
       if (res.status === 404) {
-        if (showLoading) {
+        if (showLoading && canApplyContext()) {
           setData(null);
           setActiveLeafId(null);
           setMessages([]);
@@ -477,30 +523,35 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const d = await res.json() as SessionData;
-      if (sessionIdRef.current !== sid) return null;
-      const persistedMessages = d.context.messages;
-      setData(d);
-      setActiveLeafId(d.leafId);
-      setMessages(persistedMessages);
-      setEntryIds(d.context.entryIds ?? []);
-      setCurrentModelOverride((current) => modelSwitchPendingRef.current ? current : null);
-      setError(null);
-      if (d.context.thinkingLevel && d.context.thinkingLevel !== "off") {
-        setThinkingLevel(d.context.thinkingLevel as ThinkingLevelOption);
-      }
+      if (canApplyContext()) {
+        const persistedMessages = d.context.messages;
+        setData(d);
+        setActiveLeafId(d.leafId);
+        setMessages(persistedMessages);
+        setEntryIds(d.context.entryIds ?? []);
+        setCurrentModelOverride((current) => modelSwitchPendingRef.current ? current : null);
+        setError(null);
+        if (d.context.thinkingLevel && d.context.thinkingLevel !== "off") {
+          setThinkingLevel(d.context.thinkingLevel as ThinkingLevelOption);
+        }
 
-      messagesLoaded = true;
-      if (showLoading) setLoading(false);
+        messagesLoaded = true;
+        setLoading(false);
+      }
       if (!includeState) return null;
 
       try {
         const stateRes = await fetch(`/api/sessions/${encodeURIComponent(sid)}/state`);
         if (!stateRes.ok) throw new Error(`HTTP ${stateRes.status}`);
         const agentState = await stateRes.json() as { running: boolean; state?: AgentStateResponse };
-        if (sessionIdRef.current !== sid) return null;
+        if (!canApplyState()) return null;
 
         const liveState = agentState.state;
         if (liveState) {
+          if (liveState.isCompacting !== undefined) {
+            compactionUiGenerationRef.current += 1;
+            setIsCompacting(liveState.isCompacting);
+          }
           if (liveState.contextUsage !== undefined) setContextUsage(liveState.contextUsage ?? null);
           if (liveState.systemPrompt !== undefined) setSystemPrompt(liveState.systemPrompt ?? null);
           if (liveState.thinkingLevel !== undefined) setThinkingLevel((liveState.thinkingLevel as ThinkingLevelOption) ?? "auto");
@@ -516,14 +567,26 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         return null;
       }
     } catch (e) {
-      setError(String(e));
+      if (canApplyContext()) setError(String(e));
       return null;
     } finally {
-      if (showLoading && !messagesLoaded) setLoading(false);
+      if (!messagesLoaded && (canApplyContext() || canSettleLoading())) setLoading(false);
     }
   }, []);
 
   const loadContext = useCallback(async (sid: string, leafId: string | null) => {
+    const contextGeneration = ++sessionContextLoadGenerationRef.current;
+    const loadingGeneration = ++sessionLoadingGenerationRef.current;
+    const canApplyContext = () => (
+      sessionHookMountedRef.current
+      && sessionIdRef.current === sid
+      && sessionContextLoadGenerationRef.current === contextGeneration
+    );
+    const canSettleLoading = () => (
+      sessionHookMountedRef.current
+      && sessionIdRef.current === sid
+      && sessionLoadingGenerationRef.current === loadingGeneration
+    );
     try {
       const params = new URLSearchParams({ deferThinking: "1", deferMedia: "1" });
       if (leafId) params.set("leafId", leafId);
@@ -531,22 +594,44 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       const res = await fetch(url);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const d = await res.json() as { context: { messages: AgentMessage[]; entryIds: string[] } };
+      if (!canApplyContext()) return;
       setMessages(d.context.messages);
       setEntryIds(d.context.entryIds ?? []);
+      setData((current) => current?.sessionId === sid
+        ? {
+            ...current,
+            leafId,
+            context: {
+              ...current.context,
+              messages: d.context.messages,
+              entryIds: d.context.entryIds ?? [],
+            },
+          }
+        : current);
+      if (canSettleLoading()) setLoading(false);
     } catch (e) {
-      console.error("Failed to load context:", e);
+      if (canApplyContext()) {
+        if (canSettleLoading()) setLoading(false);
+        console.error("Failed to load context:", e);
+      }
     }
   }, []);
 
   const loadTools = useCallback(async (sid: string) => {
+    const generation = ++toolsLoadGenerationRef.current;
+    const canApplyTools = () => (
+      sessionHookMountedRef.current
+      && sessionIdRef.current === sid
+      && toolsLoadGenerationRef.current === generation
+    );
     try {
       const tools = await sendAgentCommand<ToolEntry[]>(sid, { type: "get_tools" });
-      if (tools) {
-        const { getPresetFromTools } = await import("@/lib/tool-presets");
-        setToolPresetState(getPresetFromTools(tools));
-      }
+      if (!tools || !canApplyTools()) return;
+      const { getPresetFromTools } = await import("@/lib/tool-presets");
+      if (!canApplyTools()) return;
+      setToolPresetState(getPresetFromTools(tools));
     } catch (e) {
-      console.error("Failed to load tools:", e);
+      if (canApplyTools()) console.error("Failed to load tools:", e);
     }
   }, [setToolPresetState]);
 
@@ -616,6 +701,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         result.thinkingLevel
         && thinkingLevelOverrideRef.current === selectedThinkingLevel
       ) {
+        sessionStateLoadGenerationRef.current += 1;
         setThinkingLevel(result.thinkingLevel);
       }
       return realId;
@@ -636,8 +722,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const sid = sessionIdRef.current ?? await ensureNewSession();
     if (!sid) return;
 
+    const stateGeneration = ++sessionStateLoadGenerationRef.current;
     const state = await sendAgentCommand<AgentStateResponse>(sid, { type: "get_state" });
-    if (!sessionHookMountedRef.current || sessionIdRef.current !== sid) return;
+    if (
+      !sessionHookMountedRef.current
+      || sessionIdRef.current !== sid
+      || sessionStateLoadGenerationRef.current !== stateGeneration
+    ) return;
     setSystemPrompt(state.systemPrompt ?? "");
   }, [ensureNewSession]);
 
@@ -766,6 +857,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         break;
       }
       case "setStatus":
+        sessionStateLoadGenerationRef.current += 1;
         setExtensionStatuses((prev) => {
           const rest = prev.filter((item) => item.key !== request.statusKey);
           return request.statusText !== undefined
@@ -774,6 +866,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         });
         break;
       case "setWidget":
+        sessionStateLoadGenerationRef.current += 1;
         setExtensionWidgets((prev) => {
           const rest = prev.filter((item) => item.key !== request.widgetKey);
           return request.widgetLines
@@ -802,6 +895,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const settleUiStage = useCallback(() => {
     const wasRunning = agentRunningRef.current;
+    agentStageGenerationRef.current += 1;
+    sessionStateLoadGenerationRef.current += 1;
     agentRunningRef.current = false;
     setAgentRunning(false);
     setAgentPhase(null);
@@ -825,25 +920,33 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const checkServerIdle = async () => {
       if (
         generation !== eventStreamGraceGenerationRef.current
+        || !sessionHookMountedRef.current
         || sessionIdRef.current !== sid
         || !eventStreamGraceActiveRef.current
       ) return;
 
+      const stateGeneration = ++sessionStateLoadGenerationRef.current;
       try {
         const res = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json() as { running?: boolean; state?: AgentStateResponse };
         if (
           generation !== eventStreamGraceGenerationRef.current
+          || !sessionHookMountedRef.current
           || sessionIdRef.current !== sid
           || !eventStreamGraceActiveRef.current
         ) return;
+        if (sessionStateLoadGenerationRef.current !== stateGeneration) {
+          eventStreamGraceTimerRef.current = setTimeout(() => void checkServerIdle(), PROMPT_SETTLE_POLL_MS);
+          return;
+        }
 
         const state = data.state;
         const promptActive = Boolean(data.running && state && (state.isStreaming || state.isPromptRunning));
         if (promptActive) {
           eventStreamGraceActiveRef.current = false;
           eventStreamGraceTimerRef.current = null;
+          agentStageGenerationRef.current += 1;
           sdkAgentActiveRef.current = Boolean(state?.isStreaming);
           rpcPromptPendingRef.current = Boolean(state?.isPromptRunning);
           agentRunningRef.current = true;
@@ -853,6 +956,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         }
 
         if (data.running && state?.isCompacting) {
+          compactionUiGenerationRef.current += 1;
           setIsCompacting(true);
           eventStreamGraceTimerRef.current = setTimeout(() => void checkServerIdle(), PROMPT_SETTLE_POLL_MS);
           return;
@@ -865,6 +969,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         // Keep the stream alive while state cannot be verified.
         if (
           generation !== eventStreamGraceGenerationRef.current
+          || !sessionHookMountedRef.current
           || sessionIdRef.current !== sid
           || !eventStreamGraceActiveRef.current
         ) return;
@@ -878,11 +983,18 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const finishPromptWithoutStream = useCallback(async (sid: string | null = sessionIdRef.current, runId = promptRunIdRef.current) => {
     // Bail out before loadSession too: a stale finish for a previous run
     // must not overwrite the messages of the run currently streaming.
-    if (promptRunIdRef.current !== runId) return;
+    const stageGeneration = agentStageGenerationRef.current;
+    const canSettleStage = () => (
+      sessionHookMountedRef.current
+      && sessionIdRef.current === sid
+      && promptRunIdRef.current === runId
+      && agentStageGenerationRef.current === stageGeneration
+    );
+    if (!canSettleStage()) return;
     try {
       if (sid) await loadSession(sid);
     } finally {
-      if (promptRunIdRef.current !== runId) return;
+      if (!canSettleStage()) return;
       const promptWasPending = rpcPromptPendingRef.current;
       const agentWasActive = sdkAgentActiveRef.current;
       rpcPromptPendingRef.current = false;
@@ -899,18 +1011,42 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, [loadSession, notifyPromptStage, onAgentEnd, scheduleEventStreamClose, settleUiStage]);
 
   const waitForPromptSettlement = useCallback(async (sid: string, runId?: number) => {
+    const settlementRunId = runId ?? promptRunIdRef.current;
+    let stageGeneration = agentStageGenerationRef.current;
     await delay(PROMPT_SETTLE_INITIAL_DELAY_MS);
     const startedAt = Date.now();
 
     while (agentRunningRef.current && Date.now() - startedAt < PROMPT_SETTLE_MAX_MS) {
-      if (runId !== undefined && promptRunIdRef.current !== runId) return;
+      if (
+        !sessionHookMountedRef.current
+        || sessionIdRef.current !== sid
+        || promptRunIdRef.current !== settlementRunId
+      ) return;
+      if (agentStageGenerationRef.current !== stageGeneration) {
+        stageGeneration = agentStageGenerationRef.current;
+      }
+      const stateGeneration = ++sessionStateLoadGenerationRef.current;
       try {
         const res = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
         if (res.ok) {
           const data = await res.json() as { running?: boolean; state?: AgentStateResponse };
+          if (
+            !sessionHookMountedRef.current
+            || sessionIdRef.current !== sid
+            || promptRunIdRef.current !== settlementRunId
+          ) return;
+          if (agentStageGenerationRef.current !== stageGeneration) {
+            stageGeneration = agentStageGenerationRef.current;
+            await delay(PROMPT_SETTLE_POLL_MS);
+            continue;
+          }
+          if (sessionStateLoadGenerationRef.current !== stateGeneration) {
+            await delay(PROMPT_SETTLE_POLL_MS);
+            continue;
+          }
           const state = data.state;
           if (!data.running || !state || (!state.isStreaming && !state.isPromptRunning)) {
-            await finishPromptWithoutStream(sid, runId);
+            await finishPromptWithoutStream(sid, settlementRunId);
             return;
           }
         }
@@ -957,6 +1093,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const reconcileAgentState = useCallback(async (sid: string) => {
     if (!agentRunningRef.current || sessionIdRef.current !== sid) return;
     const runId = promptRunIdRef.current;
+    const stateGeneration = ++sessionStateLoadGenerationRef.current;
     try {
       const res = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
       if (!res.ok) return;
@@ -964,16 +1101,23 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // A slow response can straddle a run boundary (previous run finished
       // and the user already started the next one while this request was in
       // flight) — everything in it is stale, drop it.
-      if (sessionIdRef.current !== sid || promptRunIdRef.current !== runId) return;
+      if (
+        !sessionHookMountedRef.current
+        || sessionIdRef.current !== sid
+        || promptRunIdRef.current !== runId
+        || sessionStateLoadGenerationRef.current !== stateGeneration
+      ) return;
       const state = data.state;
       // Mirror compaction state unconditionally: a missed compaction_end
       // would otherwise leave the "Stop compaction" UI stuck. No state
       // (wrapper destroyed) means nothing is compacting.
+      compactionUiGenerationRef.current += 1;
       setIsCompacting(state?.isCompacting ?? false);
       setQueuedMessages(normalizeQueuedMessages(state?.queuedMessages));
       const busy = data.running && state
         && (state.isStreaming || state.isPromptRunning || state.isCompacting);
       if (busy) {
+        agentStageGenerationRef.current += 1;
         sdkAgentActiveRef.current = Boolean(state.isStreaming);
         rpcPromptPendingRef.current = Boolean(state.isPromptRunning);
         return;
@@ -1025,6 +1169,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         dispatch({ type: "end" });
         if (event.isStreaming === true) {
           cancelEventStreamGrace();
+          agentStageGenerationRef.current += 1;
+          sessionStateLoadGenerationRef.current += 1;
           sdkAgentActiveRef.current = true;
           agentRunningRef.current = true;
           setAgentRunning(true);
@@ -1034,6 +1180,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
       case "agent_start":
         cancelEventStreamGrace();
+        agentStageGenerationRef.current += 1;
+        sessionStateLoadGenerationRef.current += 1;
         sdkAgentActiveRef.current = true;
         agentRunningRef.current = true;
         setAgentRunning(true);
@@ -1048,11 +1196,21 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         setAgentPhase(null);
         setRetryInfo(null);
         dispatch({ type: "end" });
-        if (sessionIdRef.current) {
-          loadSession(sessionIdRef.current);
-          fetch(`/api/agent/${encodeURIComponent(sessionIdRef.current)}`)
+        {
+          const sid = sessionIdRef.current;
+          if (!sid) break;
+          const runId = promptRunIdRef.current;
+          const stateGeneration = ++sessionStateLoadGenerationRef.current;
+          void loadSession(sid);
+          fetch(`/api/agent/${encodeURIComponent(sid)}`)
             .then((r) => r.json())
             .then((d: { state?: AgentStateResponse }) => {
+              if (
+                !sessionHookMountedRef.current
+                || sessionIdRef.current !== sid
+                || promptRunIdRef.current !== runId
+                || sessionStateLoadGenerationRef.current !== stateGeneration
+              ) return;
               if (d.state?.contextUsage !== undefined) setContextUsage(d.state.contextUsage ?? null);
               if (d.state?.systemPrompt !== undefined) setSystemPrompt(d.state.systemPrompt ?? null);
               if (d.state?.extensionStatuses !== undefined) setExtensionStatuses(d.state.extensionStatuses ?? []);
@@ -1071,6 +1229,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
         const sid = sessionIdRef.current;
         const wasRunning = settleUiStage();
+        sessionStateLoadGenerationRef.current += 1;
+        compactionUiGenerationRef.current += 1;
         setIsCompacting(false);
         if (sid) {
           void loadSession(sid);
@@ -1116,6 +1276,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         if (!agentRunningRef.current) break;
         if (event.type === "message_start") {
           const msg = event.message as AgentMessage | undefined;
+          // Core-owned artifact snapshots are phase-neutral. Treating an
+          // extension progress card as an assistant stream would erase the
+          // currently-running tool indicator.
+          if (msg && isArtifactBundleMessage(msg)) break;
           if (msg?.role === "user") break;
           if (msg?.role === "assistant") {
             dispatch({ type: "snapshot", message: msg });
@@ -1145,11 +1309,42 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         break;
       }
       case "message_end": {
-        // Same late-event guard: after reconcile finished this run,
-        // loadSession already loaded this message from the session file —
-        // appending it again would duplicate it.
-        if (!agentRunningRef.current) break;
         const completed = event.message as AgentMessage | undefined;
+        if (completed && isArtifactBundleMessage(completed)) {
+          if (!agentRunningRef.current) {
+            const sid = sessionIdRef.current;
+            if (sid) {
+              const promptRunId = promptRunIdRef.current;
+              void loadSession(sid, false, false, () => (
+                promptRunIdRef.current === promptRunId
+                && !agentRunningRef.current
+              ));
+            }
+          } else {
+            invalidatePendingContextLoads();
+            setMessages((prev) => upsertArtifactBundleMessage(prev, completed));
+          }
+          // Do not dispatch stream end or switch back to waiting_model: this
+          // custom message is an out-of-band artifact update, not the model.
+          break;
+        }
+        // Same late-event guard: after reconcile finished this run,
+        // loadSession already loaded this message from the session file, so
+        // appending it again would duplicate it. Custom messages are different:
+        // extensions can persist them after the prompt has settled, so reload the
+        // authoritative context while idle instead of dropping or appending them.
+        if (!agentRunningRef.current) {
+          if (completed?.role !== "custom") break;
+          const sid = sessionIdRef.current;
+          if (!sid) break;
+          const promptRunId = promptRunIdRef.current;
+          void loadSession(sid, false, false, () => (
+            promptRunIdRef.current === promptRunId
+            && !agentRunningRef.current
+          ));
+          break;
+        }
+        if (completed) invalidatePendingContextLoads();
         if (completed && completed.role === "user") {
           // Delivered steering/follow-up messages surface here as user
           // messages. The run's initial prompt also emits one, but handleSend
@@ -1173,6 +1368,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         }
         dispatch({ type: "end" });
         setAgentPhase({ kind: "waiting_model" });
+        break;
+      }
+      case "entry_appended": {
+        const progressMessage = artifactProgressEntryToMessage(event.entry as SessionEntry);
+        if (!progressMessage) break;
+        invalidatePendingContextLoads();
+        setMessages((prev) => upsertArtifactBundleMessage(prev, progressMessage));
         break;
       }
       case "tool_execution_start": {
@@ -1215,6 +1417,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         break;
       }
       case "queue_update":
+        sessionStateLoadGenerationRef.current += 1;
         setQueuedMessages({
           steering: [...((event.steering as string[] | undefined) ?? [])],
           followUp: [...((event.followUp as string[] | undefined) ?? [])],
@@ -1228,12 +1431,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         break;
       case "auto_compaction_start":
       case "compaction_start":
+        sessionStateLoadGenerationRef.current += 1;
+        compactionUiGenerationRef.current += 1;
         setIsCompacting(true);
         setCompactError(null);
         setCompactResult(null);
         break;
       case "auto_compaction_end":
       case "compaction_end":
+        sessionStateLoadGenerationRef.current += 1;
+        compactionUiGenerationRef.current += 1;
         setIsCompacting(false);
         if (event.errorMessage) {
           setCompactError(event.errorMessage as string);
@@ -1247,7 +1454,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         handleExtensionUiRequest(event as ExtensionUiRequest);
         break;
     }
-  }, [addNotice, cancelEventStreamGrace, handleExtensionUiRequest, loadSession, notifyPromptStage, onAgentEnd, scheduleEventStreamClose, scrollToBottom, settleUiStage]);
+  }, [addNotice, cancelEventStreamGrace, handleExtensionUiRequest, invalidatePendingContextLoads, loadSession, notifyPromptStage, onAgentEnd, scheduleEventStreamClose, scrollToBottom, settleUiStage]);
   handleAgentEventRef.current = handleAgentEvent;
 
   const handleSend = useCallback(async (message: string, images?: AttachedImage[]) => {
@@ -1283,9 +1490,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         : message,
       timestamp: Date.now(),
     };
+    promptRunIdRef.current = promptRunId;
+    invalidatePendingContextLoads();
+    sessionStateLoadGenerationRef.current += 1;
+    agentStageGenerationRef.current += 1;
     setMessages((prev) => [...prev, userMsg]);
     optimisticUserMessageKeyRef.current = userMessageKey(userMsg);
-    promptRunIdRef.current = promptRunId;
     agentRunningRef.current = true;
     setAgentRunning(true);
     setAgentPhase(isSlashCommandPrompt ? { kind: "running_command" } : { kind: "waiting_model" });
@@ -1367,7 +1577,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setAgentPhase(null);
       dispatch({ type: "end" });
     }
-  }, [isNew, newSessionCwd, newSessionModel, session, ensureNewSession, ensureEventsConnected, promoteNewSession, waitForPromptSettlement, addNotice, cancelEventStreamGrace, closeEvents, composerDraftKey, reconcileAgentState, restoreSubmission]);
+  }, [isNew, newSessionCwd, newSessionModel, session, ensureNewSession, ensureEventsConnected, promoteNewSession, waitForPromptSettlement, addNotice, cancelEventStreamGrace, closeEvents, composerDraftKey, invalidatePendingContextLoads, reconcileAgentState, restoreSubmission]);
 
   const executeBash = useCallback(async (command: string, excludeFromContext: boolean) => {
     if (agentRunningRef.current || bashRunningRef.current) return;
@@ -1504,18 +1714,46 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const handleCompact = useCallback(async () => {
     const sid = sessionIdRef.current;
     if (!sid || isCompacting) return;
+    const operationGeneration = ++compactOperationGenerationRef.current;
+    let completionUiGeneration: number | null = null;
+    sessionStateLoadGenerationRef.current += 1;
+    compactionUiGenerationRef.current += 1;
     setIsCompacting(true);
     setCompactError(null);
     setCompactResult(null);
     try {
       const result = await sendAgentCommand<CompactCommandResult>(sid, { type: "compact" });
+      if (
+        !sessionHookMountedRef.current
+        || sessionIdRef.current !== sid
+        || compactOperationGenerationRef.current !== operationGeneration
+      ) return;
+      completionUiGeneration = compactionUiGenerationRef.current;
       setCompactResult(readCompactResult(result, "manual"));
-      await loadSession(sid, true);
+      await loadSession(sid, true, true, () => (
+        compactOperationGenerationRef.current === operationGeneration
+      ));
     } catch (e) {
+      if (
+        !sessionHookMountedRef.current
+        || sessionIdRef.current !== sid
+        || compactOperationGenerationRef.current !== operationGeneration
+      ) return;
+      completionUiGeneration = compactionUiGenerationRef.current;
       setCompactError(e instanceof Error ? e.message : String(e));
       setCompactResult(null);
     } finally {
-      setIsCompacting(false);
+      if (
+        sessionHookMountedRef.current
+        && sessionIdRef.current === sid
+        && compactOperationGenerationRef.current === operationGeneration
+        && completionUiGeneration !== null
+        && compactionUiGenerationRef.current === completionUiGeneration
+      ) {
+        sessionStateLoadGenerationRef.current += 1;
+        compactionUiGenerationRef.current += 1;
+        setIsCompacting(false);
+      }
     }
   }, [isCompacting, loadSession]);
 
@@ -1555,6 +1793,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const [, commandName, rawArgs = ""] = match;
     const args = rawArgs.trim();
     const sid = sessionIdRef.current ?? await ensureNewSession();
+    let compactOperationGeneration: number | null = null;
+    let compactCompletionUiGeneration: number | null = null;
+    const canApplyCompactOperation = () => (
+      compactOperationGeneration !== null
+      && sessionHookMountedRef.current
+      && sessionIdRef.current === sid
+      && compactOperationGenerationRef.current === compactOperationGeneration
+    );
     const complete = (result: BuiltinSlashCommandResult): BuiltinSlashCommandResult => {
       if (!result.handled) return result;
       if (result.error) {
@@ -1569,6 +1815,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       switch (commandName) {
         case "compact": {
           if (!sid || isCompacting) return complete({ handled: true, error: "No active session to compact" });
+          compactOperationGeneration = ++compactOperationGenerationRef.current;
+          sessionStateLoadGenerationRef.current += 1;
+          compactionUiGenerationRef.current += 1;
           setIsCompacting(true);
           setCompactError(null);
           setCompactResult(null);
@@ -1576,8 +1825,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             type: "compact",
             ...(args ? { customInstructions: args } : {}),
           });
+          if (!canApplyCompactOperation()) return { handled: true };
+          compactCompletionUiGeneration = compactionUiGenerationRef.current;
           setCompactResult(readCompactResult(result, "manual"));
-          if (await loadSession(sid, true)) promoteNewSession();
+          const agentState = await loadSession(sid, true, true, canApplyCompactOperation);
+          if (!canApplyCompactOperation()) return { handled: true };
+          if (agentState) promoteNewSession();
           return complete({ handled: true, message: "Compacted context" });
         }
 
@@ -1624,9 +1877,29 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           return { handled: false };
       }
     } catch (e) {
+      if (
+        commandName === "compact"
+        && compactOperationGeneration !== null
+        && !canApplyCompactOperation()
+      ) return { handled: true };
+      if (commandName === "compact") {
+        compactCompletionUiGeneration = compactionUiGenerationRef.current;
+      }
       return complete({ handled: true, error: e instanceof Error ? e.message : String(e) });
     } finally {
-      if (commandName === "compact") setIsCompacting(false);
+      if (
+        commandName === "compact"
+        && sessionHookMountedRef.current
+        && sessionIdRef.current === sid
+        && compactOperationGeneration !== null
+        && compactOperationGenerationRef.current === compactOperationGeneration
+        && compactCompletionUiGeneration !== null
+        && compactionUiGenerationRef.current === compactCompletionUiGeneration
+      ) {
+        sessionStateLoadGenerationRef.current += 1;
+        compactionUiGenerationRef.current += 1;
+        setIsCompacting(false);
+      }
     }
   }, [addNotice, ensureNewSession, isCompacting, loadModels, loadSession, loadSlashCommands, loadTools, promoteNewSession, onSessionStatsPanelOpen]);
 
@@ -1685,21 +1958,84 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const handleAbortCompaction = useCallback(async () => {
     const sid = sessionIdRef.current;
     if (!sid) return;
+    const operationGeneration = ++compactOperationGenerationRef.current;
+    sessionStateLoadGenerationRef.current += 1;
+    compactionUiGenerationRef.current += 1;
     try {
       await sendAgentCommand(sid, { type: "abort_compaction" });
+      if (
+        !sessionHookMountedRef.current
+        || sessionIdRef.current !== sid
+        || compactOperationGenerationRef.current !== operationGeneration
+      ) return;
+
+      // abortCompaction only signals the running task. Clear optimistically so a
+      // missed compaction_end cannot strand the Stop UI, then reconcile until the
+      // server confirms the compaction has actually settled.
+      sessionStateLoadGenerationRef.current += 1;
+      let expectedUiGeneration = ++compactionUiGenerationRef.current;
+      setIsCompacting(false);
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < PROMPT_SETTLE_MAX_MS) {
+        await delay(PROMPT_SETTLE_POLL_MS);
+        if (
+          !sessionHookMountedRef.current
+          || sessionIdRef.current !== sid
+          || compactOperationGenerationRef.current !== operationGeneration
+          || compactionUiGenerationRef.current !== expectedUiGeneration
+        ) return;
+        const stateGeneration = ++sessionStateLoadGenerationRef.current;
+        try {
+          const response = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
+          if (!response.ok) continue;
+          const data = await response.json() as { running?: boolean; state?: AgentStateResponse };
+          if (
+            !sessionHookMountedRef.current
+            || sessionIdRef.current !== sid
+            || compactOperationGenerationRef.current !== operationGeneration
+            || sessionStateLoadGenerationRef.current !== stateGeneration
+            || compactionUiGenerationRef.current !== expectedUiGeneration
+          ) continue;
+          const compacting = Boolean(data.running && data.state?.isCompacting);
+          expectedUiGeneration = ++compactionUiGenerationRef.current;
+          setIsCompacting(compacting);
+          if (!compacting) return;
+        } catch {
+          // Keep the optimistic idle state and retry while this abort owns it.
+        }
+      }
+      if (
+        sessionHookMountedRef.current
+        && sessionIdRef.current === sid
+        && compactOperationGenerationRef.current === operationGeneration
+        && compactionUiGenerationRef.current === expectedUiGeneration
+      ) {
+        sessionStateLoadGenerationRef.current += 1;
+        compactionUiGenerationRef.current += 1;
+        setIsCompacting(false);
+      }
     } catch (e) {
-      console.error("Failed to abort compaction:", e);
+      if (
+        sessionHookMountedRef.current
+        && sessionIdRef.current === sid
+        && compactOperationGenerationRef.current === operationGeneration
+      ) console.error("Failed to abort compaction:", e);
     }
   }, []);
 
   const handleRecallQueue = useCallback(async () => {
     const sid = sessionIdRef.current;
     if (!sid) return;
+    const operationGeneration = ++sessionStateLoadGenerationRef.current;
     try {
       const result = await sendAgentCommand<{ steering?: string[]; followUp?: string[] }>(sid, { type: "clear_queue" });
+      if (!sessionHookMountedRef.current || sessionIdRef.current !== sid) return;
       // clearQueue also emits an empty queue_update, but that only reaches us
       // while SSE is connected — clear locally so idle recalls update the UI.
-      setQueuedMessages({ steering: [], followUp: [] });
+      if (sessionStateLoadGenerationRef.current === operationGeneration) {
+        sessionStateLoadGenerationRef.current += 1;
+        setQueuedMessages({ steering: [], followUp: [] });
+      }
       const texts = [...(result?.steering ?? []), ...(result?.followUp ?? [])];
       if (texts.length > 0) {
         opts.chatInputRef?.current?.prependText(texts.join("\n\n"));
@@ -1711,6 +2047,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, [opts.chatInputRef, addNotice]);
 
   const handleThinkingLevelChange = useCallback(async (level: ThinkingLevelOption) => {
+    invalidatePendingContextLoads();
+    sessionStateLoadGenerationRef.current += 1;
     setThinkingLevel(level);
     if (isNew && !sessionIdRef.current) {
       thinkingLevelOverrideRef.current = level === "auto" ? null : level;
@@ -1723,14 +2061,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } catch (e) {
       console.error("Failed to set thinking level:", e);
     }
-  }, [isNew]);
+  }, [invalidatePendingContextLoads, isNew]);
 
   const handleToolPresetChange = useCallback(async (preset: ToolPreset) => {
     const toolNames = getToolNamesForPreset(preset);
+    toolsLoadGenerationRef.current += 1;
+    sessionStateLoadGenerationRef.current += 1;
     setPreferredToolPreset(preset);
     setToolPresetState(preset);
     const sid = sessionIdRef.current ?? await ensuringNewSessionRef.current;
-    if (!sid) return;
+    if (!sid || !sessionHookMountedRef.current || sessionIdRef.current !== sid) return;
     try {
       await sendAgentCommand(sid, { type: "set_tools", toolNames });
     } catch (e) {
@@ -1786,30 +2126,41 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   useEffect(() => {
     sessionHookMountedRef.current = true;
     if (session) {
-      sessionIdRef.current = session.id;
-      loadSession(session.id, true, true).then((agentState) => {
+      const sid = session.id;
+      sessionIdRef.current = sid;
+      const stateGeneration = sessionStateLoadGenerationRef.current + 1;
+      loadSession(sid, true, true).then((agentState) => {
+        if (
+          !sessionHookMountedRef.current
+          || sessionIdRef.current !== sid
+          || sessionStateLoadGenerationRef.current !== stateGeneration
+        ) return;
         if (agentState?.running) {
-          loadTools(session.id);
+          loadTools(sid);
           if (agentState.state?.isStreaming || agentState.state?.isPromptRunning) {
+            agentStageGenerationRef.current += 1;
             sdkAgentActiveRef.current = Boolean(agentState.state.isStreaming);
             rpcPromptPendingRef.current = Boolean(agentState.state.isPromptRunning);
             agentRunningRef.current = true;
             setAgentRunning(true);
             setAgentPhase(agentState.state.isStreaming ? { kind: "waiting_model" } : { kind: "running_command" });
             dispatch({ type: "start" });
-            void maintainEventsConnected(session.id);
+            void maintainEventsConnected(sid);
             if (!agentState.state.isStreaming && agentState.state.isPromptRunning) {
-              void waitForPromptSettlement(session.id);
+              void waitForPromptSettlement(sid);
             }
           }
           if (agentState.state?.isBashRunning) {
             bashRunningRef.current = true;
             setBashRunning(true);
-            void waitForBashSettlement(session.id);
+            void waitForBashSettlement(sid);
           }
         }
         if (agentState?.state) {
-          if (agentState.state.isCompacting !== undefined) setIsCompacting(agentState.state.isCompacting);
+          if (agentState.state.isCompacting !== undefined) {
+            compactionUiGenerationRef.current += 1;
+            setIsCompacting(agentState.state.isCompacting);
+          }
           if (agentState.state.contextUsage !== undefined) setContextUsage(agentState.state.contextUsage ?? null);
           if (agentState.state.systemPrompt !== undefined) setSystemPrompt(agentState.state.systemPrompt ?? null);
           if (agentState.state.thinkingLevel !== undefined) setThinkingLevel((agentState.state.thinkingLevel as ThinkingLevelOption) ?? "auto");
@@ -1821,6 +2172,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
     return () => {
       sessionHookMountedRef.current = false;
+      sessionContextLoadGenerationRef.current += 1;
+      sessionLoadingGenerationRef.current += 1;
+      sessionStateLoadGenerationRef.current += 1;
+      toolsLoadGenerationRef.current += 1;
+      agentStageGenerationRef.current += 1;
+      compactOperationGenerationRef.current += 1;
+      compactionUiGenerationRef.current += 1;
       const abandonedDraftKey = isNew ? newSessionDraftKey : null;
       if (abandonedDraftKey) {
         queueMicrotask(() => {

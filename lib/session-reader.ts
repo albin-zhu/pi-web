@@ -9,6 +9,10 @@ import { normalize as normalizePath } from "path";
 import type { AgentMessage, SessionEntry, SessionHeader, SessionInfo, SessionContext } from "./types";
 import type { SessionEntry as PiSessionEntry, SessionInfo as PiSessionInfo } from "@earendil-works/pi-coding-agent";
 import { normalizeToolCalls } from "./normalize";
+import {
+  artifactProgressEntryToMessage,
+  collapseArtifactBundleMessagePairs,
+} from "./artifact-bundle";
 import { projectIdentityKey } from "./project-identity";
 import { sessionPathKey } from "./session-path";
 import { resolveProject, type ProjectInfo } from "./worktree";
@@ -256,9 +260,10 @@ export function buildSessionContext(
     }
   }
 
+  const collapsed = collapseArtifactBundleMessagePairs(messages, entryIds);
   return {
-    messages,
-    entryIds,
+    messages: collapsed.messages,
+    entryIds: collapsed.entryIds ?? [],
     thinkingLevel: piCtx.thinkingLevel,
     model: piCtx.model,
   };
@@ -369,6 +374,8 @@ function entryToUiMessage(
         details: entry.details,
         timestamp: parseEntryTimestamp(entry.timestamp),
       };
+    case "custom":
+      return artifactProgressEntryToMessage(entry);
     default:
       return null;
   }

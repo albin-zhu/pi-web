@@ -4,6 +4,7 @@ import { memo, useState, useRef, useEffect, useMemo } from "react";
 import { MarkdownBody } from "./MarkdownBody";
 import { ImagePreview } from "./ImagePreview";
 import { MessageVideoPreviews } from "./VideoPreview";
+import { ArtifactBundleCard } from "./ArtifactBundleCard";
 import { copyText } from "@/lib/clipboard";
 import { useI18n } from "@/hooks/useI18n";
 import { parseCompactionSummary } from "@/lib/compaction-summary";
@@ -13,6 +14,10 @@ import { isEditToolName } from "@/lib/tool-names";
 import { TurnWrittenFiles } from "./TurnWrittenFiles";
 import type { WrittenFile } from "@/lib/turn-written-files";
 import { skillExpansionToCommand } from "@/lib/slash-display";
+import {
+  ARTIFACT_BUNDLE_CUSTOM_TYPE,
+  parseArtifactBundle,
+} from "@/lib/artifact-bundle";
 import type {
   AgentMessage,
   UserMessage,
@@ -183,6 +188,10 @@ interface Props {
   modelNames?: Record<string, string>;
   cwd?: string;
   onOpenFile?: (filePath: string) => void;
+  onRerunArtifact?: (runId: string, sourceSessionId: string, sourceLeafId: string | null) => boolean;
+  artifactRerunDisabled?: boolean;
+  artifactSourceSessionId?: string;
+  artifactSourceLeafId?: string | null;
   entryId?: string;
   onFork?: (entryId: string) => void;
   forking?: boolean;
@@ -247,7 +256,7 @@ function haveSameRelevantToolResults(
   return true;
 }
 
-export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, entryId, onFork, forking, onNavigate, prevAssistantEntryId, onEditContent, showTimestamp, prevTimestamp, sessionId, writtenFiles }: Props) {
+export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, onRerunArtifact, artifactRerunDisabled, artifactSourceSessionId, artifactSourceLeafId, entryId, onFork, forking, onNavigate, prevAssistantEntryId, onEditContent, showTimestamp, prevTimestamp, sessionId, writtenFiles }: Props) {
   if (message.role === "user") {
     return <UserMessageView message={message as UserMessage} cwd={cwd} onOpenFile={onOpenFile} entryId={entryId} onFork={onFork} forking={forking} onNavigate={onNavigate} prevAssistantEntryId={prevAssistantEntryId} onEditContent={onEditContent} sessionId={sessionId} />;
   }
@@ -259,10 +268,20 @@ export const MessageView = memo(function MessageView({ message, isStreaming, too
     return null;
   }
   if (message.role === "custom") {
-    if ((message as CustomMessage).customType === "compaction") {
-      return <CompactionMessageView message={message as CustomMessage} />;
+    const customMessage = message as CustomMessage;
+    if (customMessage.customType === "compaction") {
+      return <CompactionMessageView message={customMessage} />;
     }
-    return <CustomMessageView message={message as CustomMessage} cwd={cwd} onOpenFile={onOpenFile} sessionId={sessionId} />;
+    if (customMessage.customType === ARTIFACT_BUNDLE_CUSTOM_TYPE && customMessage.display !== false) {
+      const bundle = parseArtifactBundle(customMessage.details);
+      if (bundle) {
+        const onRerun = onRerunArtifact && artifactSourceSessionId
+          ? (runId: string) => onRerunArtifact(runId, artifactSourceSessionId, artifactSourceLeafId ?? null)
+          : undefined;
+        return <ArtifactBundleCard bundle={bundle} cwd={cwd} onOpenFile={onOpenFile} sessionId={sessionId} onRerun={onRerun} rerunDisabled={artifactRerunDisabled || !onRerun} />;
+      }
+    }
+    return <CustomMessageView message={customMessage} cwd={cwd} onOpenFile={onOpenFile} sessionId={sessionId} />;
   }
   if (message.role === "bashExecution") {
     return <BashExecutionView message={message as BashExecutionMessage} sessionId={sessionId} />;
@@ -275,6 +294,10 @@ export const MessageView = memo(function MessageView({ message, isStreaming, too
     && prev.modelNames === next.modelNames
     && prev.cwd === next.cwd
     && prev.onOpenFile === next.onOpenFile
+    && prev.onRerunArtifact === next.onRerunArtifact
+    && prev.artifactRerunDisabled === next.artifactRerunDisabled
+    && prev.artifactSourceSessionId === next.artifactSourceSessionId
+    && prev.artifactSourceLeafId === next.artifactSourceLeafId
     && prev.entryId === next.entryId
     && prev.onFork === next.onFork
     && prev.forking === next.forking

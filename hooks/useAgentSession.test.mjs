@@ -289,6 +289,209 @@ test("keeps one reducer-owned assistant partial and consumes Pi JSON deltas", ()
   assert.doesNotMatch(messageEndSource, /streamState\.streamingMessage/);
 });
 
+test("reconciles completed custom messages that arrive after the prompt settles", () => {
+  const messageEndSource = source.slice(
+    source.indexOf('case "message_end"'),
+    source.indexOf('case "tool_execution_start"'),
+  );
+
+  assert.match(messageEndSource, /if \(!agentRunningRef\.current\) \{\s*if \(completed\?\.role !== "custom"\) break/);
+  assert.match(messageEndSource, /loadSession\(sid, false, false, \(\) =>/);
+  assert.match(messageEndSource, /promptRunIdRef\.current === promptRunId/);
+  assert.match(messageEndSource, /&& !agentRunningRef\.current/);
+
+  const idleCustomSource = messageEndSource.slice(
+    messageEndSource.indexOf("if (!agentRunningRef.current)"),
+    messageEndSource.indexOf('if (completed && completed.role === "user")'),
+  );
+  assert.doesNotMatch(idleCustomSource, /dispatch\(\{ type: "(?:start|snapshot)"/);
+  assert.doesNotMatch(idleCustomSource, /setAgentRunning\(true\)|setAgentPhase/);
+});
+
+test("treats artifact progress entries and terminal custom messages as phase-neutral upserts", () => {
+  const streamSource = source.slice(
+    source.indexOf('case "message_start"'),
+    source.indexOf('case "tool_execution_start"'),
+  );
+  const entrySource = source.slice(
+    source.indexOf('case "entry_appended"'),
+    source.indexOf('case "tool_execution_start"'),
+  );
+
+  assert.match(streamSource, /if \(msg && isArtifactBundleMessage\(msg\)\) break/);
+  assert.match(streamSource, /if \(completed && isArtifactBundleMessage\(completed\)\)[\s\S]*?upsertArtifactBundleMessage\(prev, completed\)[\s\S]*?break/);
+  assert.match(entrySource, /artifactProgressEntryToMessage\(event\.entry as SessionEntry\)/);
+  assert.match(entrySource, /upsertArtifactBundleMessage\(prev, progressMessage\)/);
+  assert.doesNotMatch(entrySource, /dispatch\(|setAgentPhase/);
+});
+
+test("applies only the latest session context and tracks state reloads independently", () => {
+  const loadSessionSource = source.slice(
+    source.indexOf("  const loadSession = useCallback"),
+    source.indexOf("  const loadContext = useCallback"),
+  );
+  const loadContextSource = source.slice(
+    source.indexOf("  const loadContext = useCallback"),
+    source.indexOf("  const loadTools = useCallback"),
+  );
+
+  assert.match(loadSessionSource, /const contextGeneration = \+\+sessionContextLoadGenerationRef\.current/);
+  assert.match(loadSessionSource, /const loadingGeneration = showLoading \? \+\+sessionLoadingGenerationRef\.current : null/);
+  assert.match(loadSessionSource, /const stateGeneration = includeState \? \+\+sessionStateLoadGenerationRef\.current : null/);
+  assert.match(loadSessionSource, /sessionContextLoadGenerationRef\.current === contextGeneration/);
+  assert.match(loadSessionSource, /sessionStateLoadGenerationRef\.current === stateGeneration/);
+  assert.match(loadSessionSource, /if \(canApplyContext\(\)\) \{/);
+  assert.match(loadSessionSource, /if \(!canApplyState\(\)\) return null/);
+  assert.match(loadSessionSource, /if \(!messagesLoaded && \(canApplyContext\(\) \|\| canSettleLoading\(\)\)\) setLoading\(false\)/);
+  assert.match(loadContextSource, /const contextGeneration = \+\+sessionContextLoadGenerationRef\.current/);
+  assert.match(loadContextSource, /const loadingGeneration = \+\+sessionLoadingGenerationRef\.current/);
+  assert.match(loadContextSource, /sessionHookMountedRef\.current[\s\S]*?sessionIdRef\.current === sid[\s\S]*?sessionContextLoadGenerationRef\.current === contextGeneration/);
+  assert.match(loadContextSource, /if \(!canApplyContext\(\)\) return[\s\S]*?setLoading\(false\)/);
+});
+
+test("invalidates pending context reloads before direct client message writes", () => {
+  const messageEndSource = source.slice(
+    source.indexOf('case "message_end"'),
+    source.indexOf('case "tool_execution_start"'),
+  );
+  const handleSendSource = source.slice(
+    source.indexOf("  const handleSend = useCallback"),
+    source.indexOf("  const executeBash = useCallback"),
+  );
+
+  assert.ok(messageEndSource.indexOf("invalidatePendingContextLoads()") < messageEndSource.indexOf("setMessages((prev) =>"));
+  assert.ok(handleSendSource.indexOf("invalidatePendingContextLoads()") < handleSendSource.indexOf("setMessages((prev) => [...prev, userMsg])"));
+});
+
+test("owns loading and tool discovery independently from broader state updates", () => {
+  const invalidationSource = source.slice(
+    source.indexOf("  const invalidatePendingContextLoads = useCallback"),
+    source.indexOf("  useLayoutEffect(() =>"),
+  );
+  const loadToolsSource = source.slice(
+    source.indexOf("  const loadTools = useCallback"),
+    source.indexOf("  const promoteNewSession"),
+  );
+  const toolChangeSource = source.slice(
+    source.indexOf("  const handleToolPresetChange = useCallback"),
+    source.indexOf("  const scrollUserMsgToTop"),
+  );
+
+  assert.match(invalidationSource, /sessionContextLoadGenerationRef\.current \+= 1[\s\S]*?sessionLoadingGenerationRef\.current \+= 1[\s\S]*?setLoading\(false\)/);
+  assert.match(loadToolsSource, /const generation = \+\+toolsLoadGenerationRef\.current/);
+  assert.match(loadToolsSource, /sessionHookMountedRef\.current[\s\S]*?sessionIdRef\.current === sid[\s\S]*?toolsLoadGenerationRef\.current === generation/);
+  assert.match(loadToolsSource, /if \(!tools \|\| !canApplyTools\(\)\) return[\s\S]*?await import[\s\S]*?if \(!canApplyTools\(\)\) return[\s\S]*?setToolPresetState/);
+  assert.ok(toolChangeSource.indexOf("toolsLoadGenerationRef.current += 1") < toolChangeSource.indexOf("setToolPresetState(preset)"));
+});
+
+test("shares latest-wins state arbitration across agent-end and reconciliation fetches", () => {
+  const agentEndSource = source.slice(
+    source.indexOf('case "agent_end"'),
+    source.indexOf('case "agent_settled"'),
+  );
+  const reconcileSource = source.slice(
+    source.indexOf("  const reconcileAgentState = useCallback"),
+    source.indexOf("  // Recovery net for missed SSE events"),
+  );
+
+  assert.match(agentEndSource, /const sid = sessionIdRef\.current/);
+  assert.match(agentEndSource, /const runId = promptRunIdRef\.current/);
+  assert.match(agentEndSource, /const stateGeneration = \+\+sessionStateLoadGenerationRef\.current/);
+  assert.match(agentEndSource, /fetch\(`\/api\/agent\/\$\{encodeURIComponent\(sid\)\}`\)/);
+  assert.match(agentEndSource, /sessionIdRef\.current !== sid[\s\S]*?promptRunIdRef\.current !== runId[\s\S]*?sessionStateLoadGenerationRef\.current !== stateGeneration/);
+  assert.match(reconcileSource, /const stateGeneration = \+\+sessionStateLoadGenerationRef\.current/);
+  assert.match(reconcileSource, /sessionIdRef\.current !== sid[\s\S]*?promptRunIdRef\.current !== runId[\s\S]*?sessionStateLoadGenerationRef\.current !== stateGeneration/);
+});
+
+test("invalidates stale state snapshots for SSE and optimistic state writes", () => {
+  const extensionUiSource = source.slice(
+    source.indexOf("  const handleExtensionUiRequest = useCallback"),
+    source.indexOf("  const settleUiStage = useCallback"),
+  );
+  const agentStartSource = source.slice(
+    source.indexOf('case "agent_start"'),
+    source.indexOf('case "agent_end"'),
+  );
+  const queueSource = source.slice(
+    source.indexOf('case "queue_update"'),
+    source.indexOf('case "extension_ui_request"'),
+  );
+  const thinkingSource = source.slice(
+    source.indexOf("  const handleThinkingLevelChange = useCallback"),
+    source.indexOf("  const handleToolPresetChange = useCallback"),
+  );
+  const compactSource = source.slice(
+    source.indexOf("  const handleCompact = useCallback"),
+    source.indexOf("  const loadModels = useCallback"),
+  );
+
+  assert.match(extensionUiSource, /case "setStatus":[\s\S]*?sessionStateLoadGenerationRef\.current \+= 1[\s\S]*?case "setWidget":[\s\S]*?sessionStateLoadGenerationRef\.current \+= 1/);
+  assert.match(agentStartSource, /agentStageGenerationRef\.current \+= 1[\s\S]*?sessionStateLoadGenerationRef\.current \+= 1/);
+  assert.match(queueSource, /case "queue_update":[\s\S]*?sessionStateLoadGenerationRef\.current \+= 1[\s\S]*?case "compaction_start":[\s\S]*?sessionStateLoadGenerationRef\.current \+= 1/);
+  assert.match(thinkingSource, /invalidatePendingContextLoads\(\)[\s\S]*?sessionStateLoadGenerationRef\.current \+= 1[\s\S]*?setThinkingLevel\(level\)/);
+  assert.match(compactSource, /compactionUiGenerationRef\.current \+= 1[\s\S]*?setIsCompacting\(true\)[\s\S]*?sessionIdRef\.current === sid[\s\S]*?compactionUiGenerationRef\.current === completionUiGeneration[\s\S]*?setIsCompacting\(false\)/);
+});
+
+test("guards mount restoration and prompt settlement with session and stage epochs", () => {
+  const finishSource = source.slice(
+    source.indexOf("  const finishPromptWithoutStream = useCallback"),
+    source.indexOf("  const waitForPromptSettlement = useCallback"),
+  );
+  const mountSource = source.slice(
+    source.indexOf("  // Load session on mount"),
+    source.indexOf("  useEffect(() => {\n    onSystemPromptChange"),
+  );
+
+  assert.match(finishSource, /const stageGeneration = agentStageGenerationRef\.current/);
+  assert.match(finishSource, /sessionHookMountedRef\.current[\s\S]*?sessionIdRef\.current === sid[\s\S]*?promptRunIdRef\.current === runId[\s\S]*?agentStageGenerationRef\.current === stageGeneration/);
+  assert.doesNotMatch(finishSource, /sessionStateLoadGenerationRef\.current === stateGeneration/);
+  assert.match(mountSource, /const sid = session\.id[\s\S]*?const stateGeneration = sessionStateLoadGenerationRef\.current \+ 1/);
+  assert.match(mountSource, /!sessionHookMountedRef\.current[\s\S]*?sessionIdRef\.current !== sid[\s\S]*?sessionStateLoadGenerationRef\.current !== stateGeneration/);
+  assert.match(mountSource, /sessionHookMountedRef\.current = false[\s\S]*?sessionContextLoadGenerationRef\.current \+= 1[\s\S]*?sessionLoadingGenerationRef\.current \+= 1[\s\S]*?sessionStateLoadGenerationRef\.current \+= 1[\s\S]*?toolsLoadGenerationRef\.current \+= 1[\s\S]*?agentStageGenerationRef\.current \+= 1/);
+});
+
+test("keeps settlement polling alive across newer state snapshots", () => {
+  const waitSource = source.slice(
+    source.indexOf("  const waitForPromptSettlement = useCallback"),
+    source.indexOf("  const waitForBashSettlement = useCallback"),
+  );
+
+  assert.match(waitSource, /if \(sessionStateLoadGenerationRef\.current !== stateGeneration\) \{\s*await delay\(PROMPT_SETTLE_POLL_MS\);\s*continue;\s*\}/);
+  assert.match(waitSource, /let stageGeneration = agentStageGenerationRef\.current/);
+  assert.match(waitSource, /agentStageGenerationRef\.current !== stageGeneration[\s\S]*?stageGeneration = agentStageGenerationRef\.current[\s\S]*?continue/);
+  assert.doesNotMatch(waitSource, /sessionStateLoadGenerationRef\.current !== stateGeneration\s*\) return/);
+});
+
+test("arbitrates queue recall and compact completion with operation epochs", () => {
+  const recallSource = source.slice(
+    source.indexOf("  const handleRecallQueue = useCallback"),
+    source.indexOf("  const handleThinkingLevelChange = useCallback"),
+  );
+  const compactSource = source.slice(
+    source.indexOf("  const handleCompact = useCallback"),
+    source.indexOf("  const loadModels = useCallback"),
+  );
+  const builtinSource = source.slice(
+    source.indexOf("  const handleBuiltinSlashCommand = useCallback"),
+    source.indexOf("  // Let AgentSession.prompt decide atomically"),
+  );
+  const abortSource = source.slice(
+    source.indexOf("  const handleAbortCompaction = useCallback"),
+    source.indexOf("  const handleRecallQueue = useCallback"),
+  );
+
+  assert.match(recallSource, /const operationGeneration = \+\+sessionStateLoadGenerationRef\.current/);
+  assert.match(recallSource, /sessionStateLoadGenerationRef\.current === operationGeneration[\s\S]*?setQueuedMessages\(\{ steering: \[\], followUp: \[\] \}\)/);
+  assert.match(compactSource, /const operationGeneration = \+\+compactOperationGenerationRef\.current/);
+  assert.match(compactSource, /let completionUiGeneration: number \| null = null/);
+  assert.match(compactSource, /loadSession\(sid, true, true/);
+  assert.match(compactSource, /compactOperationGenerationRef\.current === operationGeneration[\s\S]*?compactionUiGenerationRef\.current === completionUiGeneration[\s\S]*?setIsCompacting\(false\)/);
+  assert.match(builtinSource, /const canApplyCompactOperation = \(\) => \([\s\S]*?sessionIdRef\.current === sid[\s\S]*?compactOperationGenerationRef\.current === compactOperationGeneration/);
+  assert.match(builtinSource, /sendAgentCommand<CompactCommandResult>[\s\S]*?if \(!canApplyCompactOperation\(\)\) return \{ handled: true \}[\s\S]*?loadSession\(sid, true, true, canApplyCompactOperation\)[\s\S]*?if \(!canApplyCompactOperation\(\)\) return \{ handled: true \}/);
+  assert.match(builtinSource, /catch \(e\) \{[\s\S]*?commandName === "compact"[\s\S]*?!canApplyCompactOperation\(\)[\s\S]*?return \{ handled: true \}/);
+  assert.match(abortSource, /const operationGeneration = \+\+compactOperationGenerationRef\.current[\s\S]*?setIsCompacting\(false\)[\s\S]*?fetch\(`\/api\/agent\/\$\{encodeURIComponent\(sid\)\}`\)[\s\S]*?setIsCompacting\(compacting\)/);
+});
+
 test("shows the latest streamed tool execution progress in the running phase", () => {
   const updateSource = source.slice(
     source.indexOf('case "tool_execution_update"'),

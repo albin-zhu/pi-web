@@ -1,0 +1,28 @@
+{
+  "name": "@albin/pi-comfyui",
+  "version": "0.1.0",
+  "description": "ComfyUI artifact publishing and progress integration for pi and pi-web",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "comfyui",
+    "pi-web"
+  ],
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.mjs"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/comfyui.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
